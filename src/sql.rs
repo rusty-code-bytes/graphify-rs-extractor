@@ -7,8 +7,8 @@ use sqlparser::{
     },
     dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
     keywords::Keyword,
-    parser::Parser,
-    tokenizer::Token,
+    parser::{IsOptional, Parser, ParserError},
+    tokenizer::{Token, TokenWithSpan, Tokenizer},
 };
 use std::{
     collections::VecDeque,
@@ -17,6 +17,72 @@ use std::{
     ops::ControlFlow,
     path::Path,
 };
+
+// MySQL permits INSERT ... VALUE as a synonym for VALUES, but sqlparser 0.59
+// only accepts VALUES. Locate that token through the INSERT header grammar:
+// identifiers, expressions, strings and quoted VALUE tokens must stay intact.
+// Keep original spans so the compatibility retry cannot shift query provenance.
+fn mysql_insert_value_tokens(sql: &str) -> Result<Option<Vec<TokenWithSpan>>, ParserError> {
+    let dialect = MySqlDialect {};
+    let tokens = Tokenizer::new(&dialect, sql).tokenize_with_location()?;
+    let token_count = tokens.len();
+    let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens);
+    let mut positions = Vec::new();
+    while parser.peek_token().token != Token::EOF {
+        if !parser.parse_keyword(Keyword::INSERT) {
+            parser.next_token();
+            continue;
+        }
+        if let Some(position) = parser.maybe_parse(|parser| {
+            let _ = parser.parse_one_of_keywords(&[
+                Keyword::LOW_PRIORITY,
+                Keyword::DELAYED,
+                Keyword::HIGH_PRIORITY,
+            ]);
+            let _ = parser.parse_keyword(Keyword::IGNORE);
+            let _ = parser.parse_keyword(Keyword::INTO);
+            parser.parse_object_name(false)?;
+            parser.parse_parenthesized_column_list(IsOptional::Optional, true)?;
+            parser.parse_insert_partition()?;
+            parser.expect_keyword_is(Keyword::VALUE)?;
+            let position = parser.get_current_index();
+            parser.expect_token(&Token::LParen)?;
+            Ok(position)
+        })? {
+            positions.push(position);
+        }
+    }
+    if positions.is_empty() {
+        return Ok(None);
+    }
+    let mut tokens: Vec<_> = (0..token_count)
+        .map(|index| parser.token_at(index).clone())
+        .collect();
+    for position in positions {
+        if let Token::Word(word) = &mut tokens[position].token {
+            word.value = "VALUES".into();
+            word.keyword = Keyword::VALUES;
+        }
+    }
+    Ok(Some(tokens))
+}
+
+fn parse_schema_statement(
+    dialect: &dyn Dialect,
+    dialect_name: &str,
+    sql: &str,
+) -> Result<Vec<Statement>, ParserError> {
+    let parsed = Parser::parse_sql(dialect, sql);
+    if parsed.is_ok() || dialect_name != "mysql" {
+        return parsed;
+    }
+    match mysql_insert_value_tokens(sql)? {
+        Some(tokens) => Parser::new(dialect)
+            .with_tokens_with_locations(tokens)
+            .parse_statements(),
+        None => parsed,
+    }
+}
 
 // Account-management statements have no table/schema projection. sqlparser's
 // generic CREATE USER grammar does not accept MySQL's user@host form. Validate
@@ -817,7 +883,7 @@ pub fn extract(
                     return Ok(());
                 }
             }
-            let statements = Parser::parse_sql(dialect.as_ref(), sql)
+            let statements = parse_schema_statement(dialect.as_ref(), dialect_name, sql)
                 .with_context(|| format!("SQL parse near line {line}"))?;
             let key = |name: &ObjectName| -> Result<String> {
                 let raw = object_key(name, dialect_name)?;
@@ -1020,6 +1086,82 @@ pub fn extract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mysql_insert_value_retry_changes_only_row_source_tokens() {
+        let sql = "CREATE TRIGGER t AFTER UPDATE ON value FOR EACH ROW BEGIN\n\
+INSERT LOW_PRIORITY IGNORE INTO value(value, `VALUE`, note) vAlUe /* VALUE */\n\
+(NEW.value, NEW.`VALUE`, 'VALUE');\n\
+INSERT INTO `VALUE`(value) VALUES ('value');\n\
+INSERT audit_log(note) VALUE (concat('VALUE', NEW.value));\n\
+END";
+        let expected = "CREATE TRIGGER t AFTER UPDATE ON value FOR EACH ROW BEGIN\n\
+INSERT LOW_PRIORITY IGNORE INTO value(value, `VALUE`, note) VALUES /* VALUE */\n\
+(NEW.value, NEW.`VALUE`, 'VALUE');\n\
+INSERT INTO `VALUE`(value) VALUES ('value');\n\
+INSERT audit_log(note) VALUES (concat('VALUE', NEW.value));\n\
+END";
+        let dialect = MySqlDialect {};
+        assert!(Parser::parse_sql(&dialect, sql).is_err());
+        let parsed = parse_schema_statement(&dialect, "mysql", sql).unwrap();
+        let control = Parser::parse_sql(&dialect, expected).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].to_string(), control[0].to_string());
+
+        let original = Tokenizer::new(&dialect, sql)
+            .tokenize_with_location()
+            .unwrap();
+        let normalized = mysql_insert_value_tokens(sql).unwrap().unwrap();
+        assert_eq!(original.len(), normalized.len());
+        let mut changes = 0;
+        for (before, after) in original.iter().zip(normalized.iter()) {
+            assert_eq!(before.span, after.span);
+            if before.token != after.token {
+                changes += 1;
+                assert!(matches!(&before.token, Token::Word(word)
+                    if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("VALUE")));
+                assert!(matches!(&after.token, Token::Word(word)
+                    if word.keyword == Keyword::VALUES));
+            }
+        }
+        assert_eq!(changes, 2);
+    }
+
+    #[test]
+    fn mysql_insert_value_retry_does_not_extend_other_query_syntax_or_dialects() {
+        for sql in [
+            "SELECT value(1)",
+            "INSERT INTO audit_log `VALUE` (1)",
+            "INSERT INTO audit_log SELECT VALUE (1)",
+            "INSERT INTO audit_log VALUES (value(1))",
+            "CREATE TABLE value(value INT DEFAULT (value(1)))",
+        ] {
+            assert!(mysql_insert_value_tokens(sql).unwrap().is_none(), "{sql}");
+        }
+        let sql = "CREATE TRIGGER t AFTER UPDATE ON source FOR EACH ROW BEGIN INSERT INTO audit_log VALUE (NEW.id); END";
+        assert!(parse_schema_statement(&MySqlDialect {}, "mysql", sql).is_ok());
+        for (name, dialect) in [
+            ("generic", Box::new(GenericDialect {}) as Box<dyn Dialect>),
+            ("postgres", Box::new(PostgreSqlDialect {})),
+            ("sqlite", Box::new(SQLiteDialect {})),
+        ] {
+            assert!(parse_schema_statement(dialect.as_ref(), name, sql).is_err());
+        }
+    }
+
+    #[test]
+    fn mysql_insert_value_retry_keeps_error_columns_after_the_rewritten_token() {
+        let sql = "CREATE TRIGGER t AFTER UPDATE ON source FOR EACH ROW BEGIN INSERT INTO audit_log VALUE(NEW.id) nonsense; END";
+        let error = parse_schema_statement(&MySqlDialect {}, "mysql", sql).unwrap_err();
+        let column = sql.find("nonsense").unwrap() + 1;
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("nonsense at Line: 1, Column: {column}")),
+            "{error}"
+        );
+    }
+
     #[test]
     fn auto_comments_and_strict_mysql_arithmetic_are_distinct() {
         let sql = b"SELECT 4--1;";
