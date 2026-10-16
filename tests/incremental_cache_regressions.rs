@@ -263,7 +263,7 @@ fn cached_callers_rebind_after_composer_maps_exclusions_deletions_and_upgrades()
 
     options.exclude.push("vendor/**".into());
     let graph = equivalent(&options);
-    assert!(edge(
+    assert!(!edge(
         &graph,
         node(&graph, "caller.php", "App\\run"),
         node(&graph, "bundled/Target.php", "Lib\\Target::save"),
@@ -345,7 +345,7 @@ fn cached_ambiguity_and_nested_project_context_remain_source_grounded() {
         put(
             root,
             &format!("{context}/composer.json"),
-            format!(r#"{{"autoload":{{"psr-4":{{"Lib\\":"{base}/"}}}}}}"#),
+            format!(r#"{{"type":"project","autoload":{{"psr-4":{{"Lib\\":"{base}/"}}}}}}"#),
         );
         put(
             root,

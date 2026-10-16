@@ -34,6 +34,7 @@ pub(crate) fn load(conn: &Connection, root: &Path, max_bytes: usize) -> Result<(
          CREATE INDEX autoload_psr4_lookup ON autoload_psr4(context,prefix);
          CREATE TABLE autoload_psr0(context TEXT, prefix TEXT, dir TEXT, priority INTEGER);
          CREATE INDEX autoload_psr0_lookup ON autoload_psr0(context,prefix);
+         CREATE TABLE autoload_psr_selected(context TEXT, name TEXT, file TEXT, PRIMARY KEY(context,name,file));
          CREATE TABLE autoload_files(context TEXT, file TEXT, safe INTEGER, generated INTEGER, PRIMARY KEY(context,file));
          CREATE TABLE autoload_file_safety(file TEXT PRIMARY KEY, safe INTEGER);
          CREATE TEMP TABLE composer_map_classmap AS SELECT * FROM autoload_classmap WHERE 0;
@@ -84,15 +85,18 @@ pub(crate) fn load(conn: &Connection, root: &Path, max_bytes: usize) -> Result<(
         let Some(vendor) = relative(root, &root.join(&dir).join(vendor)) else {
             continue;
         };
-        // Manifests in bundled libraries choose mappings for their own files,
-        // but only an explicit project boundary isolates globally visible facts.
-        let scope = if dir.is_empty() || json.get("type").and_then(Value::as_str) == Some("project")
-        {
-            dir.clone()
-        } else {
-            conn.query_row("SELECT COALESCE((SELECT scope FROM composer_contexts WHERE context='' OR substr(?1,1,length(context)+1)=context||'/' ORDER BY length(context) DESC LIMIT 1),?2)",
-                params![dir,NO_CONTEXT], |r|r.get::<_,String>(0))?
-        };
+        let containing_project: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM composer_contexts WHERE context='' OR substr(?1,1,length(context)+1)=context||'/')",
+            [&dir], |r| r.get(0))?;
+        // An extraction root (including a standalone library) or an explicit
+        // nested project describes a loader context. A bundled library's bare
+        // manifest, even beside generated maps, proves no loader was activated.
+        // Bootstrap-dependent nested loaders need an execution-order model;
+        // lexical proximity must not redirect the containing project's symbols.
+        if containing_project && json.get("type").and_then(Value::as_str) != Some("project") {
+            continue;
+        }
+        let scope = dir.clone();
         conn.execute(
             "INSERT INTO composer_contexts(context,vendor,scope) VALUES(?1,?2,?3)",
             params![dir, vendor, scope],
@@ -181,7 +185,128 @@ pub(crate) fn load(conn: &Connection, root: &Path, max_bytes: usize) -> Result<(
          DROP TABLE composer_dirs;
          DROP TABLE composer_map_classmap; DROP TABLE composer_map_psr; DROP TABLE composer_map_files;"
     ))?;
+    psr_selections(conn, root)?;
     Ok(())
+}
+
+fn psr_selections(conn: &Connection, root: &Path) -> Result<()> {
+    // Excluding a selected file changes graph visibility, not Composer's search
+    // order. Inspect only referenced names with visible competing declarations;
+    // those labels retain the case/byte spelling lost in normalized references.
+    // Stream pairs from SQLite rather than expanding contexts across all symbols
+    // or caching an entire dependency inventory in memory. Never parse hidden PHP.
+    // Keep referenced names outside the exact (domain,name) symbol lookup.
+    // Otherwise SQLite may scan every referenced name for every class symbol.
+    let _span = crate::profile::span(|| "autoload.psr_selections".into());
+    let sql = "WITH names AS (
+          SELECT DISTINCT f.context,CASE WHEN r.domain='php-method' THEN substr(r.name,1,instr(r.name,'::')-1) ELSE r.name END AS name
+          FROM refs r JOIN php_file_contexts f ON f.file=r.file
+          WHERE r.domain IN ('php-class','php-method'))
+         SELECT DISTINCT names.context,names.name,json_extract(n.json,'$.label') AS label
+         FROM names CROSS JOIN composer_contexts c ON c.context=names.context
+         CROSS JOIN symbols s ON s.domain='php-class' AND s.name=names.name
+         JOIN nodes n ON n.id=s.id
+         WHERE substr(names.name,1,1)<>'@'
+         ORDER BY names.context,names.name,label";
+    if std::env::var_os("GRE_PROFILE_SQL").is_some() {
+        let mut explain = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        let plan = explain
+            .query_map([], |row| row.get::<_, String>(3))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        eprintln!(
+            "GRE_PROFILE_SQL {}",
+            serde_json::json!({"statement": "autoload.psr_selections", "plan": plan})
+        );
+    }
+    let mut query = conn.prepare(sql)?;
+    let mut rows = query.query([])?;
+    let mut group = (String::new(), String::new(), false, false);
+    while let Some(row) = rows.next()? {
+        let context: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        let label: String = row.get(2)?;
+        if group.0 != context || group.1 != name {
+            unknown_psr_spelling(conn, &group)?;
+            group = (context.clone(), name.clone(), false, false);
+        }
+        let file = match psr_file(conn, root, &context, &name, &label, true)? {
+            Some(file) => Some(file),
+            None => psr_file(conn, root, &context, &name, &label, false)?,
+        };
+        let Some(file) = file else {
+            group.3 = true;
+            continue;
+        };
+        group.2 = true;
+        conn.prepare_cached("INSERT OR IGNORE INTO autoload_psr_selected VALUES(?1,?2,?3)")?
+            .execute(params![context, name, file])?;
+    }
+    unknown_psr_spelling(conn, &group)?;
+    Ok(())
+}
+
+fn unknown_psr_spelling(conn: &Connection, group: &(String, String, bool, bool)) -> Result<()> {
+    // Normalized references cannot disambiguate declaration-case variants.
+    // A spelling with no selected file must not be discarded in favor of one
+    // that happens to exist. The empty path is an unresolved alternative and
+    // cannot match a source file; names with no selected path keep static lookup.
+    if group.2 && group.3 {
+        conn.prepare_cached("INSERT OR IGNORE INTO autoload_psr_selected VALUES(?1,?2,'')")?
+            .execute(params![group.0, group.1])?;
+    }
+    Ok(())
+}
+
+fn psr_file(
+    conn: &Connection,
+    root: &Path,
+    context: &str,
+    name: &str,
+    label: &str,
+    psr4: bool,
+) -> Result<Option<String>> {
+    let sql = if psr4 {
+        "SELECT prefix,dir FROM autoload_psr4 WHERE context=?1 AND substr(?2,1,length(prefix))=prefix ORDER BY length(prefix) DESC,priority"
+    } else {
+        "SELECT prefix,dir FROM autoload_psr0 WHERE context=?1 AND substr(?2,1,length(prefix))=prefix ORDER BY (length(prefix)>0) DESC,priority"
+    };
+    let mut query = conn.prepare_cached(sql)?;
+    let mut rows = query.query(params![context, name])?;
+    while let Some(row) = rows.next()? {
+        let prefix: String = row.get(0)?;
+        let dir: String = row.get(1)?;
+        let encoded = if psr4 {
+            let Some(suffix) = label.get(prefix.len()..) else {
+                continue;
+            };
+            suffix
+        } else {
+            label
+        };
+        let Ok(decoded) = String::from_utf8(crate::php::decode_source(encoded)) else {
+            continue;
+        };
+        let suffix = if psr4 {
+            decoded.replace('\\', "/")
+        } else {
+            let (namespace, class) = decoded.rsplit_once('\\').unwrap_or(("", &decoded));
+            let class = class.replace('_', "/");
+            if namespace.is_empty() {
+                class
+            } else {
+                format!("{}/{class}", namespace.replace('\\', "/"))
+            }
+        };
+        let file = if dir.is_empty() {
+            format!("{suffix}.php")
+        } else {
+            format!("{dir}/{suffix}.php")
+        };
+        if root.join(&file).is_file() {
+            return Ok(Some(file));
+        }
+    }
+    Ok(None)
 }
 
 fn read(path: &Path, root: &Path, max: usize) -> Option<Vec<u8>> {

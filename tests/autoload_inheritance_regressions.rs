@@ -150,7 +150,7 @@ fn bundled_package_inherits_generated_classmap_from_containing_project() {
 }
 
 #[test]
-fn nearest_package_mapping_precedes_containing_project_mapping() {
+fn inactive_package_mapping_cannot_override_containing_project_mapping() {
     let d = TempDir::new().unwrap();
     let root = d.path();
     put(
@@ -170,12 +170,12 @@ fn nearest_package_mapping_precedes_containing_project_mapping() {
     assert!(calls_file(
         &g,
         "lib/package/Caller.php",
-        "lib/package/own/Service.php"
+        "vendor/library/Service.php"
     ));
     assert!(!calls_file(
         &g,
         "lib/package/Caller.php",
-        "vendor/library/Service.php"
+        "lib/package/own/Service.php"
     ));
 }
 
@@ -223,8 +223,7 @@ fn inherited_mappings_stop_at_an_explicit_project_boundary() {
 }
 
 #[test]
-fn authoritative_package_can_inherit_an_explicit_dependency_mapping_but_not_unique_unlisted_classes()
- {
+fn inactive_package_authority_cannot_block_containing_project_or_unique_static_candidates() {
     let d = TempDir::new().unwrap();
     let root = d.path();
     put(
@@ -256,16 +255,20 @@ fn authoritative_package_can_inherit_an_explicit_dependency_mapping_but_not_uniq
         "lib/package/Caller.php",
         "lib/package/own/Service.php"
     ));
-    // With no usable ancestor mapping, authority still prevents a unique
-    // arbitrary declaration from being treated as an autoloadable class.
+    // An unregistered library's authority also cannot block an otherwise unique
+    // static candidate once the containing project no longer selects a map.
     put(root, "composer.json", "{}");
     fs::remove_file(root.join("lib/package/own/Service.php")).unwrap();
     let g = graph(&Options::new(root));
-    assert!(!has_calls(&g, "lib/package/Caller.php"));
+    assert!(calls_file(
+        &g,
+        "lib/package/Caller.php",
+        "vendor/library/Service.php"
+    ));
 }
 
 #[test]
-fn absent_child_classmap_target_abstains_but_excluded_child_target_uses_inherited_mapping() {
+fn absent_or_excluded_explicit_project_classmap_target_cannot_rebind_ancestor_candidates() {
     let d = TempDir::new().unwrap();
     let root = d.path();
     put(
@@ -276,7 +279,7 @@ fn absent_child_classmap_target_abstains_but_excluded_child_target_uses_inherite
     put(
         root,
         "lib/package/composer.json",
-        r#"{"type":"library","config":{"classmap-authoritative":true}}"#,
+        r#"{"type":"project","config":{"classmap-authoritative":true}}"#,
     );
     put(
         root,
@@ -288,14 +291,21 @@ fn absent_child_classmap_target_abstains_but_excluded_child_target_uses_inherite
     caller(root, "lib/package/Caller.php");
     let g = graph(&Options::new(root));
     assert!(!has_calls(&g, "lib/package/Caller.php"));
-    // Existing source removed from graph is a different case from a stale map.
+    // The installed target is selected until extraction visibility hides it.
     service(root, "lib/package/vendor/missing/Service.php");
+    let g = graph(&Options::new(root));
+    assert!(calls_file(
+        &g,
+        "lib/package/Caller.php",
+        "lib/package/vendor/missing/Service.php"
+    ));
     let mut options = Options::new(root);
     options
         .exclude_file
         .push("lib/package/vendor/missing/Service.php".into());
     let g = graph(&options);
-    assert!(calls_file(
+    assert!(!has_calls(&g, "lib/package/Caller.php"));
+    assert!(!calls_file(
         &g,
         "lib/package/Caller.php",
         "vendor/library/Service.php"

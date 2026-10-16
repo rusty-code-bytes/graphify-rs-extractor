@@ -83,8 +83,10 @@ struct Scope {
     functions: HashMap<String, String>,
     class: Option<String>,
     class_id: Option<String>,
+    parent_class: Option<String>,
     has_this: bool,
     receivers: HashMap<String, String>,
+    properties: HashMap<String, String>,
     global_hints: HashMap<String, String>,
     owner: String,
 }
@@ -94,6 +96,7 @@ struct Extractor<'a> {
     file: &'a str,
     store: &'a Store,
     stats: &'a mut Stats,
+    definite_requires: HashSet<usize>,
 }
 
 fn children(node: Ast<'_>) -> Vec<Ast<'_>> {
@@ -108,6 +111,16 @@ fn qualify(namespace: &str, name: &str) -> String {
     } else {
         format!("{namespace}\\{name}")
     }
+}
+
+fn unconditional_function(node: Ast<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "program"
+            || parent.kind() == "compound_statement"
+                && parent
+                    .parent()
+                    .is_some_and(|namespace| namespace.kind() == "namespace_definition")
+    })
 }
 
 impl Extractor<'_> {
@@ -136,6 +149,172 @@ impl Extractor<'_> {
         }
         qualify(&scope.namespace, raw).to_ascii_lowercase()
     }
+    fn type_class(&self, raw: &str, scope: &Scope) -> Option<String> {
+        match raw.to_ascii_lowercase().as_str() {
+            "self" => scope.class_id.as_ref().map(|id| format!("@{id}")),
+            "parent" => scope.parent_class.clone(),
+            "static" | "array" | "bool" | "callable" | "false" | "float" | "int" | "iterable"
+            | "mixed" | "never" | "null" | "object" | "string" | "true" | "void" => None,
+            _ => Some(self.resolve_name(raw, scope, false)),
+        }
+    }
+    fn single_type_class(&self, mut ty: Ast<'_>, scope: &Scope) -> Option<String> {
+        if ty.kind() == "optional_type" {
+            ty = ty.named_child(0)?;
+        }
+        // A union/intersection supplies useful references, but cannot identify
+        // one receiver implementation. Late static binding is dynamic too.
+        (ty.kind() == "named_type")
+            .then(|| self.type_class(self.text(ty), scope))
+            .flatten()
+    }
+    fn type_references(&self, ty: Ast<'_>, scope: &Scope, context: &str) -> Result<()> {
+        let mut pending = vec![ty];
+        while let Some(current) = pending.pop() {
+            if current.kind() == "named_type" {
+                if let Some(target) = self.type_class(self.text(current), scope) {
+                    self.store.reference(
+                        &scope.owner,
+                        "php-class",
+                        &target,
+                        None,
+                        context,
+                        self.file,
+                        current.start_position().row + 1,
+                    )?;
+                }
+            } else {
+                pending.extend(children(current).into_iter().rev());
+            }
+        }
+        Ok(())
+    }
+    fn class_properties(&self, node: Ast<'_>, scope: &Scope) -> HashMap<String, String> {
+        let mut declarations = HashMap::<String, Option<String>>::new();
+        let Some(body) = node.child_by_field_name("body") else {
+            return HashMap::new();
+        };
+        let mut add = |name: Ast<'_>, ty: Option<Ast<'_>>| {
+            let class = ty.and_then(|ty| self.single_type_class(ty, scope));
+            declarations
+                .entry(self.text(name).trim_start_matches('$').to_owned())
+                .and_modify(|target| *target = None)
+                .or_insert(class);
+        };
+        for declaration in children(body) {
+            if declaration.kind() == "property_declaration" {
+                let fields = children(declaration);
+                let usable = !fields
+                    .iter()
+                    .any(|child| matches!(child.kind(), "static_modifier" | "property_hook_list"));
+                let ty = usable
+                    .then(|| declaration.child_by_field_name("type"))
+                    .flatten();
+                for element in fields
+                    .iter()
+                    .filter(|child| child.kind() == "property_element")
+                {
+                    if let Some(name) = element.child_by_field_name("name") {
+                        add(name, ty);
+                    }
+                }
+            } else if declaration.kind() == "method_declaration"
+                && declaration
+                    .child_by_field_name("name")
+                    .is_some_and(|name| self.text(name).eq_ignore_ascii_case("__construct"))
+                && let Some(parameters) = declaration.child_by_field_name("parameters")
+            {
+                for parameter in children(parameters)
+                    .into_iter()
+                    .filter(|parameter| parameter.kind() == "property_promotion_parameter")
+                {
+                    if let Some(name) = parameter
+                        .child_by_field_name("name")
+                        .filter(|name| name.kind() == "variable_name")
+                    {
+                        let ty = (!children(parameter)
+                            .iter()
+                            .any(|child| child.kind() == "property_hook_list"))
+                        .then(|| parameter.child_by_field_name("type"))
+                        .flatten();
+                        add(name, ty);
+                    }
+                }
+            }
+        }
+        let mut class_scope = scope.clone();
+        class_scope.has_this = true;
+        class_scope.properties = declarations
+            .into_iter()
+            .filter_map(|(name, class)| class.map(|class| (name, class)))
+            .collect();
+        // Constructor writes and escapes in other methods can replace the
+        // receiver before a seemingly read-only caller runs. Promoted fields
+        // retain their declared-type hint without inventing a constructor value.
+        self.property_receivers(node, &class_scope)
+    }
+    fn property_receivers(&self, node: Ast<'_>, scope: &Scope) -> HashMap<String, String> {
+        if !scope.has_this || scope.properties.is_empty() {
+            return HashMap::new();
+        }
+        let mut properties = scope.properties.clone();
+        let mut pending: Vec<_> = node.child_by_field_name("body").into_iter().collect();
+        while let Some(current) = pending.pop() {
+            if matches!(
+                current.kind(),
+                "class_declaration" | "anonymous_class" | "trait_declaration"
+            ) {
+                continue;
+            }
+            if matches!(
+                current.kind(),
+                "dynamic_variable_name"
+                    | "eval_intrinsic"
+                    | "include_expression"
+                    | "include_once_expression"
+                    | "require_expression"
+                    | "require_once_expression"
+            ) {
+                return HashMap::new();
+            }
+            if current.kind() == "function_call_expression"
+                && current
+                    .child_by_field_name("function")
+                    .is_some_and(|callee| self.text(callee).eq_ignore_ascii_case("eval"))
+            {
+                return HashMap::new();
+            }
+            if current.kind() == "variable_name" && self.text(current) == "$this" {
+                let Some(access) = current.parent().filter(|access| {
+                    matches!(
+                        access.kind(),
+                        "member_access_expression" | "nullsafe_member_access_expression"
+                    ) && access.child_by_field_name("object") == Some(current)
+                }) else {
+                    // Passing $this or invoking an opaque method can replace a
+                    // property with a subtype overriding the declared method.
+                    return HashMap::new();
+                };
+                let Some(name) = access
+                    .child_by_field_name("name")
+                    .filter(|name| name.kind() == "name")
+                else {
+                    return HashMap::new();
+                };
+                let receiver_only = access.parent().is_some_and(|call| {
+                    matches!(
+                        call.kind(),
+                        "member_call_expression" | "nullsafe_member_call_expression"
+                    ) && call.child_by_field_name("object") == Some(access)
+                });
+                if !receiver_only {
+                    properties.remove(self.text(name));
+                }
+            }
+            pending.extend(children(current));
+        }
+        properties
+    }
     fn parameter_receivers(&self, node: Ast<'_>, scope: &Scope) -> HashMap<String, String> {
         let mut receivers = HashMap::new();
         if let Some(parameters) = node.child_by_field_name("parameters") {
@@ -147,7 +326,7 @@ impl Extractor<'_> {
                 {
                     continue;
                 }
-                let (Some(name), Some(mut ty)) = (
+                let (Some(name), Some(ty)) = (
                     parameter.child_by_field_name("name"),
                     parameter.child_by_field_name("type"),
                 ) else {
@@ -156,22 +335,7 @@ impl Extractor<'_> {
                 if name.kind() != "variable_name" {
                     continue;
                 }
-                if ty.kind() == "optional_type" {
-                    let Some(inner) = ty.named_child(0) else {
-                        continue;
-                    };
-                    ty = inner;
-                }
-                if ty.kind() != "named_type" {
-                    continue;
-                }
-                let raw = self.text(ty);
-                let class = match raw.to_ascii_lowercase().as_str() {
-                    "self" => scope.class_id.as_ref().map(|id| format!("@{id}")),
-                    "parent" | "static" => None,
-                    _ => Some(self.resolve_name(raw, scope, false)),
-                };
-                if let Some(class) = class {
+                if let Some(class) = self.single_type_class(ty, scope) {
                     receivers.insert(self.text(name).to_owned(), class);
                 }
             }
@@ -243,7 +407,7 @@ impl Extractor<'_> {
     }
     fn mutates_symbol_table(&self, call: Ast<'_>, target: &str) -> bool {
         match target.rsplit('\\').next() {
-            Some("extract") => true,
+            Some("extract" | "eval") => true,
             // With an explicit output array parse_str only writes that argument.
             Some("parse_str") => call
                 .child_by_field_name("arguments")
@@ -459,6 +623,50 @@ impl Extractor<'_> {
         }
         Some(parts.join("/"))
     }
+    fn definite_requires(&self, root: Ast<'_>) -> HashSet<usize> {
+        let mut result = HashSet::new();
+        let mut prefix = true;
+        let mut pending = children(root);
+        pending.reverse();
+        while let Some(node) = pending.pop() {
+            match node.kind() {
+                "namespace_definition" => {
+                    if let Some(body) = node.child_by_field_name("body") {
+                        pending.extend(children(body).into_iter().rev());
+                    }
+                }
+                "php_tag"
+                | "comment"
+                | "namespace_use_declaration"
+                | "function_definition"
+                | "class_declaration"
+                | "interface_declaration"
+                | "trait_declaration"
+                | "enum_declaration" => {}
+                "text" if self.text(node).trim().is_empty() => {}
+                "expression_statement" if prefix => {
+                    let requirement = node.named_child(0).filter(|expression| {
+                        matches!(
+                            expression.kind(),
+                            "require_expression" | "require_once_expression"
+                        ) && expression
+                            .named_child(0)
+                            .and_then(|value| self.include_target(value))
+                            .is_some()
+                    });
+                    if let Some(requirement) = requirement {
+                        result.insert(requirement.start_byte());
+                    } else {
+                        prefix = false;
+                    }
+                }
+                // A return, branch, loop, or opaque executable statement may
+                // bypass a later require. Such includes remain ordinary facts.
+                _ => prefix = false,
+            }
+        }
+        result
+    }
     fn imports(&self, node: Ast<'_>, scope: &mut Scope) -> Result<()> {
         let declaration_type = node
             .child_by_field_name("type")
@@ -625,6 +833,12 @@ impl Extractor<'_> {
                             "php-class"
                         } else if kind == "method" {
                             "php-method"
+                        } else if !unconditional_function(node) {
+                            // A runtime guard, enclosing callable, or control
+                            // flow may suppress this declaration. Retain it for
+                            // inventory without letting it shadow a definite
+                            // unconditional function of the same name.
+                            "php-function-conditional"
                         } else {
                             "php-function"
                         },
@@ -645,12 +859,20 @@ impl Extractor<'_> {
                 if is_class {
                     next.class_id = Some(entity.id);
                     next.class = Some(fq);
+                    next.parent_class = children(node)
+                        .into_iter()
+                        .find(|child| child.kind() == "base_clause")
+                        .and_then(|base| children(base).into_iter().find(|child| named(*child)))
+                        .map(|parent| self.resolve_name(self.text(parent), scope, false));
                     next.has_this = false;
                     next.receivers.clear();
+                    next.properties = self.class_properties(node, &next);
                 } else if node.kind() == "function_definition" {
                     next.class = None;
                     next.class_id = None;
+                    next.parent_class = None;
                     next.has_this = false;
+                    next.properties.clear();
                 }
                 if !is_class {
                     let is_static = children(node).iter().any(|c| c.kind() == "static_modifier");
@@ -660,6 +882,7 @@ impl Extractor<'_> {
                         next.has_this = false;
                     }
                     next.receivers = self.parameter_receivers(node, &next);
+                    next.properties = self.property_receivers(node, &next);
                     next.global_hints = if node.kind() == "function_definition"
                         || node.kind() == "method_declaration"
                     {
@@ -667,11 +890,44 @@ impl Extractor<'_> {
                     } else {
                         HashMap::new()
                     };
+                    if let Some(ty) = node.child_by_field_name("return_type") {
+                        self.type_references(ty, &next, "references:return_type")?;
+                    }
                 }
                 for child in children(node) {
                     self.walk(child, &next, depth + 1)?;
                 }
                 return Ok(false);
+            }
+            "simple_parameter" | "variadic_parameter" | "property_promotion_parameter" => {
+                if let Some(ty) = node.child_by_field_name("type") {
+                    self.type_references(ty, scope, "references:parameter_type")?;
+                    if node.kind() == "property_promotion_parameter"
+                        && let Some(class_id) = &scope.class_id
+                    {
+                        let mut class_scope = scope.clone();
+                        class_scope.owner = class_id.clone();
+                        self.type_references(ty, &class_scope, "references:field")?;
+                    }
+                }
+            }
+            "property_declaration" => {
+                if let Some(ty) = node.child_by_field_name("type") {
+                    self.type_references(ty, scope, "references:field")?;
+                }
+            }
+            "attribute" => {
+                if let Some(name) = children(node).into_iter().find(|child| named(*child)) {
+                    self.store.reference(
+                        &scope.owner,
+                        "php-class",
+                        &self.resolve_name(self.text(name), scope, false),
+                        None,
+                        "references:attribute",
+                        self.file,
+                        line,
+                    )?;
+                }
             }
             "base_clause" | "class_interface_clause" | "use_declaration" => {
                 if node.kind() == "use_declaration"
@@ -702,6 +958,13 @@ impl Extractor<'_> {
                     .context("missing function call target")?;
                 if named(callee) {
                     let raw = self.text(callee);
+                    // This grammar represents PHP's eval construct as a named
+                    // call. Its evaluated declarations are not ordinary symbols.
+                    if raw.eq_ignore_ascii_case("eval") {
+                        self.store
+                            .symbol("php-loader-unknown", self.file, &scope.owner)?;
+                        return Ok(true);
+                    }
                     let target = self.resolve_name(raw, scope, true);
                     let fallback = (!raw.contains('\\')
                         && !scope.functions.contains_key(&raw.to_ascii_lowercase())
@@ -778,6 +1041,22 @@ impl Extractor<'_> {
                     } else {
                         scope.receivers.get(raw).cloned()
                     }
+                } else if method.kind() == "name"
+                    && scope.has_this
+                    && matches!(
+                        receiver.kind(),
+                        "member_access_expression" | "nullsafe_member_access_expression"
+                    )
+                    && receiver
+                        .child_by_field_name("object")
+                        .is_some_and(|object| {
+                            object.kind() == "variable_name" && self.text(object) == "$this"
+                        })
+                {
+                    receiver
+                        .child_by_field_name("name")
+                        .filter(|name| name.kind() == "name")
+                        .and_then(|name| scope.properties.get(self.text(name)).cloned())
                 } else {
                     None
                 };
@@ -823,14 +1102,26 @@ impl Extractor<'_> {
                         "file",
                         &target,
                         None,
-                        "includes",
+                        if self.definite_requires.contains(&node.start_byte()) {
+                            "includes:definite"
+                        } else {
+                            "includes"
+                        },
                         self.file,
                         line,
                     )?;
                 } else {
                     // A bare relative include depends on runtime cwd/include_path.
+                    // Preserve uncertainty for an active autoload file's
+                    // transitive include chain without publishing a fake edge.
+                    self.store
+                        .symbol("php-loader-unknown", self.file, &scope.owner)?;
                     self.stats.dynamic_php_references += 1;
                 }
+            }
+            "eval_intrinsic" => {
+                self.store
+                    .symbol("php-loader-unknown", self.file, &scope.owner)?;
             }
             _ => {}
         }
@@ -858,7 +1149,9 @@ pub fn extract(
         file,
         store,
         stats,
+        definite_requires: HashSet::new(),
     };
+    ex.definite_requires = ex.definite_requires(tree.root_node());
     let mut section = Vec::new();
     let base = Scope {
         owner: file_id.into(),

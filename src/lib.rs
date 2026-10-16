@@ -10,7 +10,7 @@ mod sql;
 mod store;
 
 use anyhow::{Context, Result, bail};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use model::Node;
 use serde::Serialize;
 use std::{
@@ -21,8 +21,21 @@ use std::{
 };
 use store::Store;
 
+/// The native profile preserves qualified labels; Graphify projects ownership
+/// and callable labels to the vocabulary expected by its official consumers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportProfile {
+    #[default]
+    Native,
+    Graphify,
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct Options {
+    /// Output vocabulary: native qualified labels, or official Graphify consumers.
+    #[arg(long, value_enum, default_value_t = ExportProfile::Native)]
+    pub export_profile: ExportProfile,
     /// Project root. Paths in the graph are relative to this directory.
     #[arg(default_value = ".")]
     pub root: PathBuf,
@@ -65,6 +78,7 @@ pub struct Options {
 impl Options {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
+            export_profile: ExportProfile::Native,
             root: root.into(),
             out: None,
             cache_dir: None,
@@ -275,6 +289,7 @@ pub fn extract(options: &Options) -> Result<Stats> {
     let metadata = serde_json::json!({
         "producer": "graphify-rust-extractor", "version": env!("CARGO_PKG_VERSION"),
         "scope": "structural", "id_scheme": "gre-sha256-v1", "stats": &stats,
+        "export_profile": options.export_profile,
         "sql_dialect": options.sql_dialect, "sql_mode": "schema", "incremental": false,
         "sql_scope_rules": options.sql_scope,
         "sql_resolution": "same file, then unique dialect/context/schema target; no cross-context fallback",
@@ -288,7 +303,7 @@ pub fn extract(options: &Options) -> Result<Stats> {
     let mut temp = tempfile::NamedTempFile::new_in(&out)?;
     {
         let mut writer = BufWriter::new(temp.as_file_mut());
-        store.export(&mut writer, &metadata)?;
+        store.export(&mut writer, &metadata, options.export_profile)?;
         writer.flush()?;
     }
     temp.as_file().sync_all()?;

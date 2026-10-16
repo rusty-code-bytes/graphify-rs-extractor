@@ -77,6 +77,20 @@ fn statement_profiling_preserves_contextual_parent_and_duplicate_resolution() {
         if profiling {
             let diagnostics = String::from_utf8_lossy(&result.stderr);
             assert!(diagnostics.contains("GRE_PROFILE_SQL"));
+            let psr_plan: Value = diagnostics
+                .lines()
+                .filter_map(|line| line.strip_prefix("GRE_PROFILE_SQL "))
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|value| value["statement"] == "autoload.psr_selections")
+                .unwrap();
+            assert!(
+                psr_plan["plan"].as_array().unwrap().iter().any(|step| step
+                    .as_str()
+                    .unwrap()
+                    .contains("symbols_1 (domain=? AND name=?)")),
+                "PSR physical lookup must probe exact referenced names: {psr_plan}"
+            );
+
             assert!(diagnostics.contains("resolve.sql:CREATE TABLE class_bindings"));
             assert!(diagnostics.contains("class_contexts_lookup"));
             assert!(diagnostics.contains("php_candidates_paths (domain=? AND file>? AND file<?)"));

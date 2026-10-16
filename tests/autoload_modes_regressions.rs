@@ -44,7 +44,7 @@ fn generated(root: &Path, name: &str, entries: &str) {
 }
 
 #[test]
-fn generated_psr0_selects_duplicate_classes_and_inherited_methods_with_excluded_source_fallback() {
+fn generated_psr0_selects_duplicate_classes_and_never_rebinds_excluded_sources() {
     let d = TempDir::new().unwrap();
     let root = d.path();
     put(root, "composer.json", "{}");
@@ -82,36 +82,45 @@ fn generated_psr0_selects_duplicate_classes_and_inherited_methods_with_excluded_
         } else {
             "vendor/purifier/library"
         };
-        assert!(edge(
-            &g,
-            node(&g, "app.php", "App"),
-            node(
+        assert_eq!(
+            edge(
                 &g,
-                &format!("{base}/HTMLPurifier/AttrDef.php"),
-                "HTMLPurifier_AttrDef"
+                node(&g, "app.php", "App"),
+                node(
+                    &g,
+                    &format!("{base}/HTMLPurifier/AttrDef.php"),
+                    "HTMLPurifier_AttrDef"
+                ),
+                "extends"
             ),
-            "extends"
-        ));
-        assert!(edge(
-            &g,
-            node(&g, "app.php", "App::run"),
-            node(
+            !excluded
+        );
+        assert_eq!(
+            edge(
                 &g,
-                &format!("{base}/HTMLPurifier/AttrDef.php"),
-                "HTMLPurifier_AttrDef::parseCDATA"
+                node(&g, "app.php", "App::run"),
+                node(
+                    &g,
+                    &format!("{base}/HTMLPurifier/AttrDef.php"),
+                    "HTMLPurifier_AttrDef::parseCDATA"
+                ),
+                "calls"
             ),
-            "calls"
-        ));
-        assert!(edge(
-            &g,
-            node(&g, "app.php", "App::run"),
-            node(
+            !excluded
+        );
+        assert_eq!(
+            edge(
                 &g,
-                &format!("{base}/HTMLPurifier/URIParser.php"),
-                "HTMLPurifier_URIParser"
+                node(&g, "app.php", "App::run"),
+                node(
+                    &g,
+                    &format!("{base}/HTMLPurifier/URIParser.php"),
+                    "HTMLPurifier_URIParser"
+                ),
+                "instantiates"
             ),
-            "instantiates"
-        ));
+            !excluded
+        );
         if !excluded {
             assert!(!edge(
                 &g,
@@ -176,7 +185,7 @@ fn source_manifest_psr0_and_files_inherit_within_project_but_stop_at_project_bou
 }
 
 #[test]
-fn generated_files_select_exact_imported_and_global_functions_preserving_local_declarations() {
+fn generated_files_select_exact_functions_preserve_locals_and_never_rebind_excluded_sources() {
     let d = TempDir::new().unwrap();
     let root = d.path();
     put(root, "composer.json", "{}");
@@ -213,8 +222,14 @@ fn generated_files_select_exact_imported_and_global_functions_preserving_local_d
             "vendor/library/functions.php"
         };
         let run = node(&g, "caller.php", "App\\run");
-        assert!(edge(&g, run, node(&g, file, "Vendor\\assist"), "calls"));
-        assert!(edge(&g, run, node(&g, file, "helper"), "calls"));
+        assert_eq!(
+            edge(&g, run, node(&g, file, "Vendor\\assist"), "calls"),
+            !excluded
+        );
+        assert_eq!(edge(&g, run, node(&g, file, "helper"), "calls"), !excluded);
+        if excluded {
+            assert!(!calls(&g, run));
+        }
         if !excluded {
             assert!(!edge(
                 &g,
@@ -374,7 +389,7 @@ fn psr0_does_not_alias_raw_identifier_bytes_to_valid_unicode_filename() {
 }
 
 #[test]
-fn autoload_file_early_return_abstains_without_overriding_other_definitions_or_local_binding() {
+fn autoload_file_early_return_and_guarded_local_declaration_remain_ambiguous() {
     let d = TempDir::new().unwrap();
     let root = d.path();
     put(
@@ -403,7 +418,7 @@ function local_call() { helper(); }
     );
     let g = graph(&Options::new(root));
     assert!(!calls(&g, node(&g, "caller.php", "run")));
-    assert!(edge(
+    assert!(!edge(
         &g,
         node(&g, "registered.php", "Lib\\local_call"),
         node(&g, "registered.php", "Lib\\helper"),
@@ -417,7 +432,7 @@ function local_call() { helper(); }
 }
 
 #[test]
-fn function_exists_guard_and_function_body_returns_remain_eligible_for_registered_file_selection() {
+fn function_exists_guard_does_not_prove_which_runtime_declaration_is_active() {
     let d = TempDir::new().unwrap();
     let root = d.path();
     put(
@@ -445,7 +460,7 @@ $closure = function () { return 4; };
         "<?php function run() { \\Lib\\helper(); }",
     );
     let g = graph(&Options::new(root));
-    assert!(edge(
+    assert!(!edge(
         &g,
         node(&g, "caller.php", "run"),
         node(&g, "registered.php", "Lib\\helper"),
@@ -460,12 +475,13 @@ $closure = function () { return 4; };
 }
 
 #[test]
-fn generated_registered_functions_precede_bare_package_manifest_but_not_another_generated_loader() {
+fn generated_root_functions_precede_inactive_package_metadata_and_projects_keep_their_scope() {
     for (child_generated, excluded, project) in [
         (false, false, false),
         (false, true, false),
         (true, false, false),
         (false, false, true),
+        (true, false, true),
     ] {
         let d = TempDir::new().unwrap();
         let root = d.path();
@@ -513,32 +529,29 @@ fn generated_registered_functions_precede_bare_package_manifest_but_not_another_
         }
         let g = graph(&options);
         let caller = node(&g, "lib/package/src/Caller.php", "Aws\\caller");
-        if child_generated {
-            assert!(
-                !calls(&g, caller),
-                "two registered function files must remain ambiguous"
-            );
+        let target = if project {
+            "lib/package/src/functions.php"
         } else {
-            let target = if excluded || project {
-                "lib/package/src/functions.php"
-            } else {
-                "vendor/library/functions.php"
-            };
+            "vendor/library/functions.php"
+        };
+        if excluded {
+            assert!(!calls(&g, caller));
+        } else {
             assert!(
                 edge(&g, caller, node(&g, target, "Aws\\describe_type"), "calls"),
-                "excluded={excluded}, project={project}"
+                "excluded={excluded}, project={project}, child_generated={child_generated}"
             );
-            if !excluded {
-                assert_eq!(
-                    edge(
-                        &g,
-                        caller,
-                        node(&g, "vendor/library/functions.php", "Aws\\describe_type"),
-                        "calls"
-                    ),
-                    !project
-                );
-            }
+        }
+        if !excluded {
+            assert_eq!(
+                edge(
+                    &g,
+                    caller,
+                    node(&g, "vendor/library/functions.php", "Aws\\describe_type"),
+                    "calls"
+                ),
+                !project
+            );
         }
         assert!(edge(
             &g,
@@ -550,8 +563,7 @@ fn generated_registered_functions_precede_bare_package_manifest_but_not_another_
 }
 
 #[test]
-fn unsafe_generated_function_evidence_blocks_source_fallback_but_invalid_metadata_does_not_claim_provenance()
- {
+fn unsafe_generated_function_evidence_blocks_fallback_and_invalid_maps_cannot_activate_libraries() {
     let d = TempDir::new().unwrap();
     let root = d.path();
     put(root, "composer.json", "{}");
@@ -585,14 +597,19 @@ fn unsafe_generated_function_evidence_blocks_source_fallback_but_invalid_metadat
         &g,
         node(&g, "lib/package/src/Caller.php", "Aws\\caller")
     ));
-    // Whole-map rejection must discard its stronger provenance too.
+    // Whole-map rejection must discard its stronger provenance too. The nested
+    // library manifest still does not register its competing function file.
     generated(
         root,
         "files",
         r#"'registered'=>$vendorDir.'/library/functions.php','dynamic'=>unknown(),"#,
     );
     let g = graph(&Options::new(root));
-    assert!(edge(
+    assert!(!calls(
+        &g,
+        node(&g, "lib/package/src/Caller.php", "Aws\\caller")
+    ));
+    assert!(!edge(
         &g,
         node(&g, "lib/package/src/Caller.php", "Aws\\caller"),
         node(&g, "lib/package/src/functions.php", "Aws\\describe_type"),

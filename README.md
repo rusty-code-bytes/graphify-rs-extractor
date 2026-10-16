@@ -18,6 +18,7 @@ cargo build --release --locked
 ./target/release/graphify-extractor extract /path/to/project \
   --out /path/to/output \
   --workers 8 \
+  --export-profile graphify \
   --parse-input-mib 8
 
 # Small bundled example
@@ -35,7 +36,9 @@ printed to stderr and stored in `graph.json.graph.stats`.
 
 ## How it works
 
-Files are discovered with exclusions applied before reading. Parsers write facts
+Files are discovered with exclusions applied before source extraction. Composer
+loader metadata and referenced initialization files may still be inspected to
+preserve loader precedence. Parsers write facts
 to temporary SQLite databases; a global resolver connects declarations and
 references, then streams the final JSON to an atomically published file. There
 is no project-wide in-memory graph during extraction.
@@ -46,14 +49,19 @@ remain serial, so eight workers do not imply eight fully occupied CPU cores.
 
 | Language | Extracted structure |
 |---|---|
-| PHP | Declarations, calls, inheritance, traits, imports, includes and statically resolvable receivers; namespace and Composer autoload context, duplicate symbols and `parent::` calls |
-| SQL | Tables, columns, foreign keys, views/index declarations and migration events; dialect- and context-aware table resolution |
+| PHP | Declarations, calls, inheritance, traits, imports, includes, type references and statically resolvable receivers (including typed properties); namespace and Composer autoload context, duplicate symbols and `parent::` calls |
+| SQL | Tables, columns, inline/ALTER foreign keys, views and their query dependencies, indexes and migration events; dialect- and context-aware table resolution |
 | HTML | Local links, form actions and asset references to files present in the extracted corpus, including literal HTML within PHP templates |
 
 Ambiguous or dynamic references are left unresolved rather than assigned an
 arbitrary target. Installed Composer dependencies can change both graph coverage
 and resolution. To include ignored `vendor/` directories, use `--no-gitignore`;
 the extractor does not install dependencies or run Composer scripts.
+Excluding a selected classmap/PSR dependency does not activate a visible duplicate.
+Nested library manifests alone do not establish an active Composer loader;
+runtime loader registration remains a static-analysis limitation. Unknown or
+excluded autoload function sources, including delegated includes, can leave
+external function calls unresolved rather than redirect them to a duplicate.
 
 ## Filtering
 
@@ -118,9 +126,10 @@ nonstandard layouts can specify shared or per-file scopes:
   --sql-scope 'backups/**=@file'
 ```
 
-Scope rules affect resolution, not file inclusion. SQL inside PHP strings,
-framework migration DSLs and view-query dependencies are not semantically
-analyzed. Unsupported SQL syntax fails explicitly; binary COPY is unsupported.
+Scope rules affect resolution, not file inclusion. SQL inside PHP strings and
+framework migration DSLs are not semantically analyzed. View dependencies respect
+CTE scopes. Unsupported SQL syntax, including `CREATE VIEW ... AS TABLE ...` and
+binary COPY, fails explicitly.
 
 ## Graphify compatibility and limitations
 
@@ -129,6 +138,19 @@ multiple relations between the same endpoints. Nodes and edges retain source
 provenance; call/import edges carry contexts used by official query filters.
 Compatibility has been exercised with Graphify 0.9.91.
 
+Use `--export-profile graphify` for official query, affected-node and path tools.
+This projects ownership/import/trait relations into Graphify's vocabulary and
+uses bare method labels for override traversal. IDs and resolved targets stay
+unchanged; `qualified_name` and `original_relation` retain the original values
+where projected. The default `native` profile retains qualified method labels
+and native relations. Parameter, return and field contexts remain distinct,
+even when they reference the same declaration.
+
+```sh
+graphify query "SomeClass" --graph /path/to/output/graph.json
+graphify affected "SomeClass" --graph /path/to/output/graph.json
+```
+
 Use Graphify to **load and query the completed graph**. Rust entity IDs are not
 compatible with Python's merge/watch/cache protocol. Do not run official
 extract/update against this output expecting identities to remain stable.
@@ -136,7 +158,7 @@ Clustering, LLM enrichment and Python manifests are not generated. Graphify's
 reader still loads the finished graph into RAM.
 
 Static analysis cannot fully resolve runtime-generated autoloaders, dynamic PHP
-calls or PHP-version-dependent polyfills. Hack files are explicitly inventoried
+calls or guarded/polyfill declarations without proof of the active definition. Hack files are explicitly inventoried
 without symbol extraction. HTML parsing is tolerant and does not provide exact
 line locations. This tool does not claim complete semantic coverage or identical
 output to the Python extractor.
@@ -149,15 +171,20 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-The current suite contains 122 tests, including parser, ambiguity, autoload,
-SQL scope, cache invalidation and parallel determinism regressions. Repaired
-scenarios should retain a focused test with correct-target and wrong-target
-assertions, rather than relying only on agreement with Python.
+Regression tests cover parser behavior, ambiguity, autoload selection, SQL scopes,
+cache invalidation, parallel determinism and export profiles. Repaired scenarios
+retain correct-target, forbidden-target and source-provenance assertions.
 
-Local validation on Magento, Moodle and Nextcloud with dependencies preserved
-byte-identical graphs across 12 validation runs and 36 performance runs after
-the latest optimizations; all 52 selected official query outputs were unchanged.
-These checks establish regression stability, not project-wide semantic accuracy.
+Optional official-consumer integration tests require Graphify's Python dependencies:
+
+```sh
+python3 tests/graphify_consumers.py --upstream /path/to/graphify-source \
+  --binary target/release/graphify-extractor --out /tmp/consumer-gate.json
+```
+
+Large-project checks are curated regression evidence, not a measurement of
+whole-project semantic accuracy. Graphs intentionally change when missing
+references are added or incorrect targets are removed.
 Raw benchmarks, downloaded corpora and generated graphs are intentionally not
 published in this repository.
 

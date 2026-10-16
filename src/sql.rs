@@ -2,7 +2,8 @@ use crate::{Stats, model::Node, store::Store};
 use anyhow::{Context, Result, bail};
 use sqlparser::{
     ast::{
-        AlterTableOperation, ColumnOption, ObjectName, ObjectNamePart, Statement, TableConstraint,
+        AlterTableOperation, ColumnOption, ObjectName, ObjectNamePart, Query, SetExpr, Statement,
+        TableConstraint, TableFactor, Visit, Visitor,
     },
     dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
     keywords::Keyword,
@@ -13,6 +14,7 @@ use std::{
     collections::VecDeque,
     fs::File,
     io::{BufReader, Bytes, Read},
+    ops::ControlFlow,
     path::Path,
 };
 
@@ -343,13 +345,20 @@ fn statements<R: Read>(
                 || input.peek(2)?.is_none_or(|c| c.is_ascii_whitespace()))
             || (dialect == "mysql" && b == b'#')
         {
+            let mut ended_line = false;
             while let Some(c) = input.next()? {
                 if c == b'\n' {
+                    ended_line = true;
                     break;
                 }
             }
             if !buffer.is_empty() {
-                append(&mut buffer, b' ', skip, limit)?;
+                append(
+                    &mut buffer,
+                    if ended_line { b'\n' } else { b' ' },
+                    skip,
+                    limit,
+                )?;
             }
             continue;
         }
@@ -366,6 +375,9 @@ fn statements<R: Read>(
                 executable_comment = true;
                 continue;
             }
+            if !buffer.is_empty() {
+                append(&mut buffer, b' ', skip, limit)?;
+            }
             let mut nesting = 1usize;
             while nesting > 0 {
                 if input.starts(b"*/")? {
@@ -374,12 +386,15 @@ fn statements<R: Read>(
                 } else if dialect == "postgres" && input.starts(b"/*")? {
                     input.eat(2)?;
                     nesting += 1;
-                } else if input.next()?.is_none() {
-                    bail!("unterminated SQL comment near line {line}");
+                } else {
+                    match input.next()? {
+                        None => bail!("unterminated SQL comment near line {line}"),
+                        Some(b'\n') if !buffer.is_empty() => {
+                            append(&mut buffer, b'\n', skip, limit)?;
+                        }
+                        _ => {}
+                    }
                 }
-            }
-            if !buffer.is_empty() {
-                append(&mut buffer, b' ', skip, limit)?;
             }
             continue;
         }
@@ -512,6 +527,117 @@ fn object_key(name: &ObjectName, dialect: &str) -> Result<String> {
         );
     }
     Ok(serde_json::to_string(&parts)?)
+}
+
+// Query callbacks keep CTE visibility lexical. In a nonrecursive WITH, a CTE's
+// definition sees earlier siblings, while the main query sees all siblings.
+// A nested WITH must not leak its names into a later sibling/subquery.
+struct QueryScope {
+    ctes: Vec<(usize, String)>,
+    visible: usize,
+    recursive: bool,
+}
+
+struct ViewReads<'a, F> {
+    dialect: &'a str,
+    scopes: Vec<QueryScope>,
+    emit: F,
+}
+
+impl<F: FnMut(&ObjectName) -> Result<()>> Visitor for ViewReads<'_, F> {
+    type Break = anyhow::Error;
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        fn has_table_query(body: &SetExpr) -> bool {
+            match body {
+                SetExpr::Table(_) => true,
+                SetExpr::SetOperation { left, right, .. } => {
+                    has_table_query(left) || has_table_query(right)
+                }
+                _ => false,
+            }
+        }
+        // sqlparser's TABLE query stores names as strings, losing quoting and
+        // token provenance. Refuse that form rather than inventing a binding.
+        if has_table_query(&query.body) {
+            return ControlFlow::Break(anyhow::anyhow!(
+                "SQL view TABLE query lacks identifier provenance; use SELECT FROM"
+            ));
+        }
+        if let Some(parent) = self.scopes.last_mut()
+            && let Some(i) = parent
+                .ctes
+                .iter()
+                .position(|(ptr, _)| *ptr == query as *const Query as usize)
+        {
+            parent.visible =
+                if self.dialect == "sqlite" || (parent.recursive && self.dialect != "mysql") {
+                    parent.ctes.len()
+                } else {
+                    i + usize::from(parent.recursive)
+                };
+        }
+        let mut ctes = Vec::new();
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                let name = ObjectName(vec![ObjectNamePart::Identifier(cte.alias.name.clone())]);
+                let key = match object_key(&name, self.dialect) {
+                    Ok(key) => key,
+                    Err(error) => return ControlFlow::Break(error),
+                };
+                if ctes.iter().any(|(_, prior)| prior == &key) {
+                    return ControlFlow::Break(anyhow::anyhow!("duplicate SQL CTE name"));
+                }
+                ctes.push((cte.query.as_ref() as *const Query as usize, key));
+            }
+        }
+        self.scopes.push(QueryScope {
+            visible: ctes.len(),
+            ctes,
+            recursive: query.with.as_ref().is_some_and(|with| with.recursive),
+        });
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        self.scopes.pop();
+        if let Some(parent) = self.scopes.last_mut()
+            && parent
+                .ctes
+                .iter()
+                .any(|(ptr, _)| *ptr == query as *const Query as usize)
+        {
+            parent.visible = parent.ctes.len();
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        // Aliases and function names are not physical relations. Walking only
+        // table factors also avoids mistaking column qualifiers for FROM names.
+        if let TableFactor::Table {
+            name, args: None, ..
+        } = factor
+        {
+            let key = match object_key(name, self.dialect) {
+                Ok(key) => key,
+                Err(error) => return ControlFlow::Break(error),
+            };
+            if name.0.len() == 1
+                && self.scopes.iter().rev().any(|scope| {
+                    scope.ctes[..scope.visible]
+                        .iter()
+                        .any(|(_, cte)| cte == &key)
+                })
+            {
+                return ControlFlow::Continue(());
+            }
+            if let Err(error) = (self.emit)(name) {
+                return ControlFlow::Break(error);
+            }
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 pub fn extract(
@@ -758,10 +884,37 @@ pub fn extract(
                             }
                         }
                     }
-                    Statement::CreateView { name, .. } => {
-                        let node = Node::new(file, "view", &name.to_string(), "sql", line);
+                    Statement::CreateView { name, query, .. } => {
+                        let mut node = Node::new(file, "view", &key(&name)?, "sql", line);
+                        node.label = name.to_string();
                         store.node(&node)?;
+                        store.sql_definition(file, &key(&name)?, &node.id)?;
                         store.edge(file_id, &node.id, "defines", file, line)?;
+                        let mut visitor = ViewReads {
+                            dialect: dialect_name,
+                            scopes: Vec::new(),
+                            emit: |target: &ObjectName| {
+                                let target_line = target.0.first().and_then(|part| match part {
+                                    ObjectNamePart::Identifier(ident) => {
+                                        usize::try_from(ident.span.start.line).ok()
+                                    }
+                                    _ => None,
+                                });
+                                store.reference(
+                                    &node.id,
+                                    "sql-relation",
+                                    &key(target)?,
+                                    None,
+                                    "reads_from",
+                                    file,
+                                    line + target_line.unwrap_or(1).saturating_sub(1),
+                                )
+                            },
+                        };
+                        if let ControlFlow::Break(error) = query.visit(&mut visitor) {
+                            return Err(error)
+                                .with_context(|| format!("SQL view query near line {line}"));
+                        }
                     }
                     Statement::AlterTable {
                         name, operations, ..
@@ -785,12 +938,21 @@ pub fn extract(
                             line,
                         )?;
                         for operation in operations {
-                            if let AlterTableOperation::AddConstraint {
-                                constraint: TableConstraint::ForeignKey { foreign_table, .. },
-                                ..
-                            } = operation
-                            {
-                                foreign_key(&node.id, &name, &foreign_table)?;
+                            match operation {
+                                AlterTableOperation::AddConstraint {
+                                    constraint: TableConstraint::ForeignKey { foreign_table, .. },
+                                    ..
+                                } => foreign_key(&node.id, &name, &foreign_table)?,
+                                AlterTableOperation::AddColumn { column_def, .. } => {
+                                    for option in column_def.options {
+                                        if let ColumnOption::ForeignKey { foreign_table, .. } =
+                                            option.option
+                                        {
+                                            foreign_key(&node.id, &name, &foreign_table)?;
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }

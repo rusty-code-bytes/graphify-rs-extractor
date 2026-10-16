@@ -51,7 +51,7 @@ fn generated(root: &Path, context: &str, name: &str, entries: &str) {
 }
 
 #[test]
-fn installed_composer_psr4_restores_duplicate_edges_and_excluded_vendor_uses_visible_fallback() {
+fn installed_composer_psr4_restores_duplicate_edges_without_rebinding_excluded_vendor() {
     let d = TempDir::new().unwrap();
     let root = d.path();
     put(root, "composer.json", "{}");
@@ -104,32 +104,41 @@ dispatch();
             "vendor/guzzlehttp/guzzle/src"
         };
         let source = "public/lib/classes/http_client.php";
-        assert!(linked(
-            &graph,
-            node(&graph, source, "core\\http_client"),
-            node(&graph, &format!("{base}/Client.php"), "GuzzleHttp\\Client"),
-            "extends"
-        ));
-        assert!(linked(
-            &graph,
-            node(&graph, source, "core\\http_client::__construct"),
-            node(
+        assert_eq!(
+            linked(
                 &graph,
-                &format!("{base}/Client.php"),
-                "GuzzleHttp\\Client::__construct"
+                node(&graph, source, "core\\http_client"),
+                node(&graph, &format!("{base}/Client.php"), "GuzzleHttp\\Client"),
+                "extends"
             ),
-            "calls"
-        ));
-        assert!(linked(
-            &graph,
-            node(&graph, source, "core\\http_client::get_handlers"),
-            node(
+            !excluded
+        );
+        assert_eq!(
+            linked(
                 &graph,
-                &format!("{base}/HandlerStack.php"),
-                "GuzzleHttp\\HandlerStack::create"
+                node(&graph, source, "core\\http_client::__construct"),
+                node(
+                    &graph,
+                    &format!("{base}/Client.php"),
+                    "GuzzleHttp\\Client::__construct"
+                ),
+                "calls"
             ),
-            "calls"
-        ));
+            !excluded
+        );
+        assert_eq!(
+            linked(
+                &graph,
+                node(&graph, source, "core\\http_client::get_handlers"),
+                node(
+                    &graph,
+                    &format!("{base}/HandlerStack.php"),
+                    "GuzzleHttp\\HandlerStack::create"
+                ),
+                "calls"
+            ),
+            !excluded
+        );
         assert!(linked(
             &graph,
             node(&graph, source, source),
@@ -180,7 +189,7 @@ fn duplicate_fqns_without_mapping_remain_ambiguous_and_vendor_is_not_special() {
 }
 
 #[test]
-fn source_psr4_uses_longest_prefix_then_directory_order_and_indexed_fallback() {
+fn source_psr4_uses_longest_prefix_and_installed_directory_order_despite_exclusion() {
     let d = TempDir::new().unwrap();
     let root = d.path();
     put(
@@ -230,6 +239,15 @@ fn source_psr4_uses_longest_prefix_then_directory_order_and_indexed_fallback() {
     let mut options = Options::new(root);
     options.exclude_file.push("first/A.php".into());
     let graph = run(&options);
+    assert!(!linked(
+        &graph,
+        node(&graph, "caller.php", "run"),
+        node(&graph, "second/A.php", "Demo\\A::work"),
+        "calls"
+    ));
+    // Actual deletion changes the loader's directory search result.
+    fs::remove_file(root.join("first/A.php")).unwrap();
+    let graph = run(&Options::new(root));
     assert!(linked(
         &graph,
         node(&graph, "caller.php", "run"),
@@ -280,8 +298,7 @@ fn generated_classmap_precedes_psr4_and_local_declarations_precede_both() {
 }
 
 #[test]
-fn authoritative_classmap_blocks_unlisted_nonlocal_classes_but_preserves_local_and_excluded_targets()
- {
+fn authoritative_classmap_blocks_unlisted_and_excluded_targets_but_preserves_local_declarations() {
     let d = TempDir::new().unwrap();
     let root = d.path();
     put(
@@ -315,7 +332,8 @@ fn authoritative_classmap_blocks_unlisted_nonlocal_classes_but_preserves_local_a
     let mut options = Options::new(root);
     options.exclude_file.push("vendor/pkg/Listed.php".into());
     let graph = run(&options);
-    assert!(linked(
+    assert!(!has_calls(&graph, node(&graph, "caller.php", "listed")));
+    assert!(!linked(
         &graph,
         node(&graph, "caller.php", "listed"),
         node(&graph, "bundled/Listed.php", "Demo\\Listed::work"),
@@ -508,7 +526,7 @@ fn literal_percent_and_underscore_in_paths_are_not_sql_wildcards() {
     put(
         root,
         "app_one/deps_foo/composer.json",
-        r#"{"autoload":{"psr-4":{"Demo\\":"src/"}}}"#,
+        r#"{"type":"project","autoload":{"psr-4":{"Demo\\":"src/"}}}"#,
     );
     put(
         root,

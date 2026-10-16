@@ -101,8 +101,7 @@ fn psr0_keeps_full_namespace_and_namespace_underscores_with_classmap_and_psr4_pr
 }
 
 #[test]
-fn ancestor_and_child_autoload_files_conflicts_cannot_override_functions_or_enable_global_fallback()
-{
+fn inactive_library_autoload_files_cannot_override_root_functions_or_enable_global_fallback() {
     for workers in [1, 4] {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
@@ -146,8 +145,12 @@ fn ancestor_and_child_autoload_files_conflicts_cannot_override_functions_or_enab
             entity(&g, "root_functions.php", "Lib\\only_root")
         ));
         for source in [namespaced, aliased] {
+            assert!(calls(
+                &g,
+                source,
+                entity(&g, "root_functions.php", "Lib\\shared")
+            ));
             for (file, label) in [
-                ("root_functions.php", "Lib\\shared"),
                 ("lib/package/child_functions.php", "Lib\\shared"),
                 ("global.php", "shared"),
             ] {

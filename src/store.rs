@@ -323,6 +323,7 @@ impl Store {
         self.resolver_batch(
             "CREATE INDEX sql_defs_lookup ON sql_defs(file,name);
             CREATE INDEX refs_lookup ON refs(domain,name);
+            CREATE INDEX php_include_refs ON refs(file,name) WHERE domain='file';
             CREATE INDEX refs_owner ON refs(source,relation);
             CREATE INDEX nodes_file ON nodes(file);",
         )?;
@@ -338,9 +339,10 @@ impl Store {
              GROUP BY s.domain,s.name,n.file;
              CREATE UNIQUE INDEX local_symbols_lookup ON local_symbols(domain,name,file);
              CREATE TABLE php_candidates AS
-             SELECT f.scope,s.domain,s.name,s.id,n.file,json_extract(n.json,'$.label') AS label
+             SELECT f.scope,s.domain,s.name,s.id,n.file,json_extract(n.json,'$.label') AS label,
+                    CAST(substr(json_extract(n.json,'$.source_location'),2) AS INTEGER) AS line
              FROM symbols s JOIN nodes n ON n.id=s.id JOIN php_file_contexts f ON f.file=n.file
-             WHERE s.domain IN ('php-class','php-function');
+             WHERE s.domain IN ('php-class','php-function','php-function-conditional');
              CREATE INDEX php_candidates_lookup ON php_candidates(scope,domain,name,file);
              CREATE INDEX php_candidates_file ON php_candidates(file,name,domain);
              -- Composer path checks have a domain equality and directory range.
@@ -397,8 +399,21 @@ impl Store {
               AND (y.prefixed>x.prefixed OR (y.prefixed=x.prefixed AND y.priority<x.priority)))
              GROUP BY x.context,x.name;
              CREATE UNIQUE INDEX psr0_targets_lookup ON psr0_targets(context,name);
-             CREATE TABLE psr_targets AS SELECT * FROM psr4_targets UNION ALL SELECT x.* FROM psr0_targets x
-              WHERE NOT EXISTS(SELECT 1 FROM psr4_targets y WHERE x.context=y.context AND x.name=y.name);
+             -- Physical search-path selection outranks graph visibility. When
+             -- spelling variants select different files, preserve ambiguity.
+             CREATE TABLE psr_file_targets AS
+             SELECT m.context,m.name,MIN(p.id) AS id,
+              CASE WHEN COUNT(DISTINCT m.file)>1 THEN 2 ELSE COUNT(DISTINCT p.id) END AS count
+             FROM autoload_psr_selected m LEFT JOIN php_candidates p
+              ON p.domain='php-class' AND p.name=m.name AND p.file=m.file
+             GROUP BY m.context,m.name;
+             CREATE UNIQUE INDEX psr_file_targets_lookup ON psr_file_targets(context,name);
+             CREATE TABLE psr_targets AS SELECT * FROM psr_file_targets
+              UNION ALL SELECT x.* FROM psr4_targets x
+               WHERE NOT EXISTS(SELECT 1 FROM psr_file_targets y WHERE x.context=y.context AND x.name=y.name)
+              UNION ALL SELECT x.* FROM psr0_targets x
+               WHERE NOT EXISTS(SELECT 1 FROM psr_file_targets y WHERE x.context=y.context AND x.name=y.name)
+                AND NOT EXISTS(SELECT 1 FROM psr4_targets y WHERE x.context=y.context AND x.name=y.name);
              CREATE UNIQUE INDEX psr_targets_lookup ON psr_targets(context,name);
              CREATE TABLE class_names AS
              SELECT DISTINCT f.context,CASE WHEN r.domain='php-method' THEN substr(r.name,1,instr(r.name,'::')-1) ELSE r.name END AS name
@@ -415,21 +430,21 @@ impl Store {
                LEFT JOIN classmap_targets m ON m.context=x.map_context AND m.name=x.name
                LEFT JOIN psr_targets p ON p.context=x.map_context AND p.name=x.name
                WHERE x.context=names.context AND x.name=names.name
-                AND ((m.name IS NOT NULL AND (m.count>0 OR m.indexed OR NOT m.present))
+                AND (m.name IS NOT NULL
                  OR (p.name IS NOT NULL AND (x.authoritative=0 OR m.name IS NOT NULL)))
                ORDER BY x.specificity DESC LIMIT 1) AS map_context,
               COALESCE((SELECT MAX(x.authoritative) FROM class_contexts x
-               WHERE x.context=names.context AND x.name=names.name),0) AS authoritative,
-              EXISTS(SELECT 1 FROM class_contexts x JOIN classmap_targets m ON m.context=x.map_context AND m.name=x.name
-               WHERE x.context=names.context AND x.name=names.name AND m.present AND NOT m.indexed AND m.count=0) AS excluded_target
+               WHERE x.context=names.context AND x.name=names.name),0) AS authoritative
              FROM class_names names;
              CREATE UNIQUE INDEX class_map_contexts_lookup ON class_map_contexts(context,name);
              CREATE TABLE class_bindings AS
              SELECT names.context,names.name,CASE
               WHEN m.count>0 THEN CASE WHEN m.count=1 THEN m.id END
-              WHEN m.name IS NOT NULL AND (m.indexed OR NOT m.present) THEN NULL
-              WHEN inherited.authoritative=1 AND inherited.map_context IS NULL AND NOT inherited.excluded_target THEN NULL
-              WHEN p.count=1 THEN p.id WHEN p.count>1 THEN NULL
+              -- A selected map entry blocks fallback even when its installed
+              -- file was excluded from extraction or its definition is absent.
+              WHEN m.name IS NOT NULL THEN NULL
+              WHEN inherited.authoritative=1 AND inherited.map_context IS NULL THEN NULL
+              WHEN p.name IS NOT NULL THEN CASE WHEN p.count=1 THEN p.id END
               WHEN u.count=1 THEN u.id END AS id
              FROM class_names names LEFT JOIN composer_contexts c ON c.context=names.context
              LEFT JOIN php_unique_symbols u ON u.scope=COALESCE(c.scope,'@none') AND u.domain='php-class' AND u.name=names.name
@@ -438,13 +453,40 @@ impl Store {
              LEFT JOIN psr_targets p ON p.context=inherited.map_context AND p.name=names.name;
              CREATE UNIQUE INDEX class_bindings_lookup ON class_bindings(context,name);
              CREATE TABLE autoload_function_targets AS
-             SELECT f.context,p.name,f.generated,MIN(CASE WHEN f.safe THEN p.id END) AS id,
-              COUNT(DISTINCT CASE WHEN f.safe THEN p.id END) AS count,MAX(NOT f.safe) AS unsafe FROM autoload_files f
-             JOIN php_candidates p ON p.file=f.file AND p.domain='php-function' GROUP BY f.context,p.name,f.generated;
+             SELECT f.context,p.name,f.generated,MIN(CASE WHEN f.safe AND p.domain='php-function' THEN p.id END) AS id,
+              COUNT(DISTINCT CASE WHEN f.safe AND p.domain='php-function' THEN p.id END) AS count,
+              MAX(NOT f.safe OR p.domain='php-function-conditional') AS unsafe FROM autoload_files f
+             JOIN php_candidates p ON p.file=f.file AND p.domain IN ('php-function','php-function-conditional') GROUP BY f.context,p.name,f.generated;
              CREATE UNIQUE INDEX autoload_function_targets_lookup ON autoload_function_targets(context,name,generated);
              CREATE TABLE function_names AS
              SELECT DISTINCT f.context,r.name FROM refs r JOIN php_file_contexts f ON f.file=r.file WHERE r.domain='php-function'
              UNION SELECT f.context,r.fallback FROM refs r JOIN php_file_contexts f ON f.file=r.file WHERE r.domain='php-function' AND r.fallback IS NOT NULL;
+             -- Follow only files reachable from an active loader inventory.
+             -- UNION terminates cycles; function-body and conditional includes
+             -- supply possible uncertainty, never definite activation evidence.
+             CREATE TABLE autoload_reachable_files AS
+             WITH RECURSIVE reachable(context,file,generated) AS (
+              SELECT context,file,generated FROM autoload_files
+              UNION
+              SELECT loaded.context,r.name,loaded.generated FROM reachable loaded
+              JOIN refs r ON r.file=loaded.file AND r.domain='file'
+               AND r.relation IN ('includes','includes:definite'))
+             SELECT context,file,generated FROM reachable;
+             CREATE INDEX autoload_reachable_files_lookup ON autoload_reachable_files(context,file,generated);
+             -- An active files inventory may load a symbol from an excluded or
+             -- missing source. Its unknown names cannot justify rebinding to a
+             -- visible bundled copy. Summarize only referenced contexts.
+             CREATE TABLE function_unknown_sources AS
+             SELECT names.context,MAX(f.generated) AS generated
+             FROM (SELECT DISTINCT context FROM function_names) names
+             JOIN composer_contexts own ON own.context=names.context
+             JOIN composer_contexts c ON c.scope=own.scope AND (c.context='' OR c.context=names.context OR substr(names.context,1,length(c.context)+1)=c.context||'/')
+             JOIN autoload_reachable_files f ON f.context=c.context
+             LEFT JOIN php_file_contexts visible ON visible.file=f.file
+             WHERE visible.file IS NULL OR EXISTS(SELECT 1 FROM symbols uncertain
+              WHERE uncertain.domain='php-loader-unknown' AND uncertain.name=f.file)
+             GROUP BY names.context;
+             CREATE UNIQUE INDEX function_unknown_sources_lookup ON function_unknown_sources(context);
              CREATE TABLE function_evidence AS
              SELECT names.context,names.name,t.id,t.count,t.unsafe,t.generated
              FROM function_names names JOIN composer_contexts own ON own.context=names.context
@@ -455,11 +497,19 @@ impl Store {
              -- Rank before safety checks so an unsafe generated wrapper blocks weaker evidence.
              CREATE TABLE function_bindings AS
              SELECT names.context,names.name,CASE
+              WHEN guarded.count>0 THEN NULL
+              WHEN unknown.generated>MAX(t.generated) THEN NULL
               WHEN MAX(t.unsafe)=1 OR MAX(t.count)>1 OR COUNT(DISTINCT t.id)>1 THEN NULL
-              WHEN COUNT(DISTINCT t.id)=1 THEN MIN(t.id) WHEN u.count=1 THEN u.id END AS id,
-              (COALESCE(u.count,0)>0 OR COUNT(t.name)>0) AS exists_name
+              -- A normally completed loader registers its definite declaration
+              -- even when a sibling source's symbol inventory is unknown.
+              WHEN COUNT(DISTINCT t.id)=1 THEN MIN(t.id)
+              WHEN unknown.generated IS NOT NULL THEN NULL
+              WHEN u.count=1 THEN u.id END AS id,
+              (COALESCE(u.count,0)>0 OR COALESCE(guarded.count,0)>0 OR COUNT(t.name)>0 OR unknown.generated IS NOT NULL) AS exists_name
              FROM function_names names LEFT JOIN composer_contexts own ON own.context=names.context
              LEFT JOIN php_unique_symbols u ON u.scope=COALESCE(own.scope,'@none') AND u.domain='php-function' AND u.name=names.name
+             LEFT JOIN php_unique_symbols guarded ON guarded.scope=COALESCE(own.scope,'@none') AND guarded.domain='php-function-conditional' AND guarded.name=names.name
+             LEFT JOIN function_unknown_sources unknown ON unknown.context=names.context
              LEFT JOIN function_evidence t ON t.context=names.context AND t.name=names.name
               AND t.generated=(SELECT MAX(x.generated) FROM function_evidence x WHERE x.context=names.context AND x.name=names.name)
              GROUP BY names.context,names.name;
@@ -469,12 +519,12 @@ impl Store {
              SELECT r.rowid, CASE WHEN l.count IS NOT NULL THEN l.id ELSE u.id END
              FROM refs r LEFT JOIN local_symbols l ON l.domain=r.domain AND l.name=r.name AND l.file=r.file
              LEFT JOIN unique_symbols u ON u.domain=r.domain AND u.name=r.name
-             WHERE r.domain NOT IN ('php-class','php-function','php-method','php-parent-method','sql-table') AND (l.count=1 OR (l.count IS NULL AND u.id IS NOT NULL));
+             WHERE r.domain NOT IN ('php-class','php-function','php-method','php-parent-method','sql-table','sql-relation') AND (l.count=1 OR (l.count IS NULL AND u.id IS NOT NULL));
              INSERT OR IGNORE INTO resolved_refs
              SELECT r.rowid, CASE WHEN l.count IS NOT NULL THEN l.id ELSE u.id END
              FROM refs r LEFT JOIN local_symbols l ON l.domain=r.domain AND l.name=r.fallback AND l.file=r.file
              LEFT JOIN unique_symbols u ON u.domain=r.domain AND u.name=r.fallback
-             WHERE r.domain NOT IN ('php-class','php-function','php-method','php-parent-method','sql-table') AND (l.count=1 OR (l.count IS NULL AND u.id IS NOT NULL))
+             WHERE r.domain NOT IN ('php-class','php-function','php-method','php-parent-method','sql-table','sql-relation') AND (l.count=1 OR (l.count IS NULL AND u.id IS NOT NULL))
              AND NOT EXISTS(SELECT 1 FROM symbols s WHERE s.domain=r.domain AND s.name=r.name);
              INSERT INTO resolved_refs
              SELECT r.rowid,CASE WHEN l.count IS NOT NULL THEN l.id ELSE b.id END
@@ -488,6 +538,22 @@ impl Store {
              LEFT JOIN local_symbols l ON l.domain='php-function' AND l.name=r.name AND l.file=r.file
              LEFT JOIN function_bindings u ON u.context=f.context AND u.name=r.name
              WHERE r.domain='php-function' AND (l.count=1 OR (l.count IS NULL AND u.id IS NOT NULL));
+             -- A preceding definite require suppresses local runtime alternatives
+             -- only when it identifies the sole unconditional declaration. A
+             -- conditional declaration in another file remains ambiguous.
+             INSERT OR IGNORE INTO resolved_refs
+             SELECT r.rowid,u.id FROM refs r JOIN php_file_contexts f ON f.file=r.file
+             JOIN php_unique_symbols u ON u.scope=f.scope AND u.domain='php-function' AND u.name=r.name AND u.count=1
+             JOIN nodes target ON target.id=u.id
+             JOIN local_symbols guarded ON guarded.domain='php-function-conditional' AND guarded.name=r.name AND guarded.file=r.file
+             JOIN refs requirement ON requirement.domain='file' AND requirement.name=target.file AND requirement.file=r.file AND requirement.relation='includes:definite'
+             JOIN nodes owner ON owner.id=requirement.source AND owner.file=r.file AND json_extract(owner.json,'$.type')='file'
+             JOIN resolved_refs included ON included.ref=requirement.rowid
+             JOIN nodes required ON required.id=included.target AND required.file=target.file AND json_extract(required.json,'$.type')='file'
+             WHERE r.domain='php-function' AND r.line>requirement.line
+              AND NOT EXISTS(SELECT 1 FROM function_unknown_sources unknown WHERE unknown.context=f.context)
+              AND NOT EXISTS(SELECT 1 FROM php_candidates p WHERE p.scope=f.scope AND p.domain='php-function-conditional' AND p.name=r.name
+               AND (p.file!=r.file OR p.line<=requirement.line));
              INSERT OR IGNORE INTO resolved_refs
              SELECT r.rowid,CASE WHEN l.count IS NOT NULL THEN l.id ELSE u.id END
              FROM refs r JOIN php_file_contexts f ON f.file=r.file
@@ -495,23 +561,27 @@ impl Store {
              LEFT JOIN function_bindings u ON u.context=f.context AND u.name=r.fallback
              WHERE r.domain='php-function' AND (l.count=1 OR (l.count IS NULL AND u.id IS NOT NULL))
               AND NOT EXISTS(SELECT 1 FROM function_bindings s WHERE s.context=f.context AND s.name=r.name AND s.exists_name);
+             CREATE TABLE sql_candidates AS
+             SELECT 'sql-relation' AS domain,d.file,d.name,d.id FROM sql_defs d
+             UNION ALL SELECT 'sql-table',d.file,d.name,d.id FROM sql_defs d JOIN nodes n ON n.id=d.id
+              WHERE json_extract(n.json,'$.type')='table';
              CREATE TABLE sql_local AS
-             SELECT file,name,MIN(id) AS id,COUNT(*) AS count FROM sql_defs GROUP BY file,name;
-             CREATE UNIQUE INDEX sql_local_lookup ON sql_local(file,name);
+             SELECT domain,file,name,MIN(id) AS id,COUNT(*) AS count FROM sql_candidates GROUP BY domain,file,name;
+             CREATE UNIQUE INDEX sql_local_lookup ON sql_local(domain,file,name);
              CREATE TABLE sql_scoped AS
-             SELECT f.dialect,f.scope,d.name,
+             SELECT d.domain,f.dialect,f.scope,d.name,
              COALESCE(MIN(CASE WHEN f.role!='migration' THEN d.id END),MIN(d.id)) AS id,
              CASE WHEN SUM(f.role!='migration')>0 THEN SUM(f.role!='migration') ELSE COUNT(*) END AS count
-             FROM sql_defs d JOIN sql_files f ON f.file=d.file GROUP BY f.dialect,f.scope,d.name;
-             CREATE UNIQUE INDEX sql_scoped_lookup ON sql_scoped(dialect,scope,name);
+             FROM sql_candidates d JOIN sql_files f ON f.file=d.file GROUP BY d.domain,f.dialect,f.scope,d.name;
+             CREATE UNIQUE INDEX sql_scoped_lookup ON sql_scoped(domain,dialect,scope,name);
              INSERT INTO resolved_refs
              SELECT r.rowid,CASE WHEN l.count IS NOT NULL THEN l.id ELSE g.id END
              FROM refs r JOIN sql_files f ON f.file=r.file
-             LEFT JOIN sql_local l ON l.file=r.file AND l.name=r.name
-             LEFT JOIN sql_scoped g ON g.dialect=f.dialect AND g.scope=f.scope AND g.name=r.name
-             WHERE r.domain='sql-table' AND (l.count=1 OR (l.count IS NULL AND g.count=1));
+             LEFT JOIN sql_local l ON l.domain=r.domain AND l.file=r.file AND l.name=r.name
+             LEFT JOIN sql_scoped g ON g.domain=r.domain AND g.dialect=f.dialect AND g.scope=f.scope AND g.name=r.name
+             WHERE r.domain IN ('sql-table','sql-relation') AND (l.count=1 OR (l.count IS NULL AND g.count=1));
              INSERT OR IGNORE INTO edges
-             SELECT r.source,x.target,r.relation,r.file,r.line,r.confidence
+             SELECT r.source,x.target,CASE WHEN r.relation='includes:definite' THEN 'includes' ELSE r.relation END,r.file,r.line,r.confidence
              FROM refs r JOIN resolved_refs x ON x.ref=r.rowid ORDER BY r.confidence,r.line;"
         )?;
         drop(setup_span);
@@ -603,7 +673,12 @@ impl Store {
             |row| row.get(0),
         )?)
     }
-    pub fn export(&self, writer: &mut impl Write, metadata: &impl serde::Serialize) -> Result<()> {
+    pub fn export(
+        &self,
+        writer: &mut impl Write,
+        metadata: &impl serde::Serialize,
+        profile: crate::ExportProfile,
+    ) -> Result<()> {
         // Graphify's NetworkX consumers use links. Only one representation is emitted.
         writer.write_all(b"{\"directed\":true,\"multigraph\":true,\"graph\":")?;
         serde_json::to_writer(&mut *writer, metadata)?;
@@ -616,11 +691,27 @@ impl Store {
                 writer.write_all(b",")?;
             }
             first = false;
-            writer.write_all(row.get::<_, String>(0)?.as_bytes())?;
+            let json: String = row.get(0)?;
+            if profile == crate::ExportProfile::Graphify {
+                let mut node: serde_json::Value = serde_json::from_str(&json)?;
+                if node["language"] == "php"
+                    && node["type"] == "method"
+                    && let Some(label) = node["label"].as_str().map(str::to_owned)
+                    && let Some((_, method)) = label.rsplit_once("::")
+                {
+                    node["label"] =
+                        serde_json::Value::String(format!(".{}()", method.to_ascii_lowercase()));
+                    node["qualified_name"] = serde_json::Value::String(label);
+                }
+                serde_json::to_writer(&mut *writer, &node)?;
+            } else {
+                writer.write_all(json.as_bytes())?;
+            }
         }
         writer.write_all(b"],\"links\":[")?;
         let mut query = self.conn.prepare(
-            "SELECT e.source,e.target,e.relation,e.file,e.line,e.confidence
+            "SELECT e.source,e.target,e.relation,e.file,e.line,e.confidence,
+             json_extract(a.json,'$.type'),json_extract(b.json,'$.type')
             FROM edges e JOIN nodes a ON a.id=e.source JOIN nodes b ON b.id=e.target
             ORDER BY e.source,e.target,e.relation",
         )?;
@@ -637,19 +728,47 @@ impl Store {
             let file: String = row.get(3)?;
             let line: u64 = row.get(4)?;
             let confidence: String = row.get(5)?;
+            let owner_kind: String = row.get(6)?;
+            let target_kind: String = row.get(7)?;
+            // Internal context suffixes preserve parameter/return edges between
+            // the same endpoints without changing the on-disk raw-fact schema.
+            let (native_relation, reference_context) = relation.strip_prefix("references:").map_or(
+                (
+                    if relation == "includes:definite" {
+                        "includes"
+                    } else {
+                        relation.as_str()
+                    },
+                    None,
+                ),
+                |context| ("references", Some(context)),
+            );
+            let projected = if profile == crate::ExportProfile::Graphify {
+                match native_relation {
+                    "defines" if owner_kind == "file" => "contains",
+                    "defines" if target_kind == "method" => "method",
+                    "includes" => "requires",
+                    "instantiates" => "calls",
+                    "uses_trait" => "mixes_in",
+                    other => other,
+                }
+            } else {
+                native_relation
+            };
             serde_json::to_writer(
                 &mut *writer,
                 &Edge {
                     source: &source,
                     target: &target,
-                    relation: &relation,
+                    relation: projected,
+                    original_relation: (projected != native_relation).then_some(native_relation),
                     // Graphify filters on context, not relation (including filters
                     // inferred from questions such as "Who calls foo?").
-                    context: match relation.as_str() {
+                    context: reference_context.or(match native_relation {
                         "calls" | "instantiates" => Some("call"),
                         "imports" | "includes" => Some("import"),
                         _ => None,
-                    },
+                    }),
                     confidence: &confidence,
                     confidence_score: if confidence == "EXTRACTED" { 1.0 } else { 0.7 },
                     weight: 1.0,

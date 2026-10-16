@@ -53,6 +53,8 @@ pub struct Edge<'a> {
     pub target: &'a str,
     pub relation: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_relation: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<&'a str>,
     pub confidence: &'a str,
     pub confidence_score: f64,
