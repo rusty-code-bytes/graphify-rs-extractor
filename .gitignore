@@ -1,0 +1,41 @@
+# Build outputs and generated graphs/cache
+/target/
+/graphify-out/
+**/graphify-out/
+/benchmarks/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Downloaded corpora and dependency installations
+/corpora/
+/repos/
+/downloads/
+node_modules/
+.venv/
+venv/
+/vendor/*
+!/vendor/tree-sitter-php/
+
+# Local research notes and corpus-specific tooling
+/AGENTS.md
+/GRAPHIFY_EXTRACTION_ANALYSIS.md
+/VALIDATION.md
+/scripts/*
+!/scripts/check_graphify.py
+!/scripts/measure.py
+
+# Machine/editor files and credentials
+.DS_Store
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+.codex/
+.agents/
+.idea/
+.vscode/

@@ -1,0 +1,89 @@
+--- a/common/define-grammar.js
++++ b/common/define-grammar.js
+@@ -150,26 +150,27 @@
+           return seq(
+             optional($.text),
+             optional(seq(
+-              $.php_tag,
++              choice($.php_tag, $.short_echo_statement),
+               repeat($.statement),
+             )),
+           );
+         }
+ 
+         return seq(
+-          optional($.php_tag),
++          optional(choice($.php_tag, $.short_echo_statement)),
+           repeat($.statement),
+           optional($.php_end_tag),
+         );
+       },
+ 
+-      php_tag: _ => /<\?([pP][hH][pP]|=)?/,
++      php_tag: _ => /<\?([pP][hH][pP])?/,
++      short_echo_statement: $ => seq(alias('<?=', $.php_tag), $._expressions, $._semicolon),
+       php_end_tag: _ => '?>',
+ 
+       text_interpolation: $ => seq(
+         $.php_end_tag,
+         optional($.text),
+-        choice($.php_tag, $._eof),
++        choice($.php_tag, $.short_echo_statement, $._eof),
+       ),
+ 
+       text: _ => repeat1(choice(
+@@ -294,7 +295,7 @@
+         field('body', $.namespace_use_group),
+       ),
+ 
+-      namespace_use_group: $ => seq('{', commaSep1($.namespace_use_clause), '}'),
++      namespace_use_group: $ => seq('{', commaSep1($.namespace_use_clause), optional(','), '}'),
+ 
+       trait_declaration: $ => seq(
+         optional(field('attributes', $.attribute_list)),
+@@ -561,8 +562,10 @@
+ 
+       property_promotion_parameter: $ => seq(
+         optional(field('attributes', $.attribute_list)),
+-        field('visibility', $.visibility_modifier),
+-        field('readonly', optional($.readonly_modifier)),
++        choice(
++          seq(field('visibility', $.visibility_modifier), field('readonly', optional($.readonly_modifier))),
++          field('readonly', $.readonly_modifier),
++        ),
+         field('type', optional($.type)), // Note: callable is not a valid type here, but instead of complicating the parser, we defer this checking to any intelligence using the parser
+         field('name', choice($.by_ref, $.variable_name)),
+         optional(seq('=', field('default_value', $.expression))),
+@@ -657,13 +660,13 @@
+       _return_type: $ => seq(':', field('return_type', choice($.type, $.bottom_type))),
+ 
+       _const_element: $ => seq($.name, '=', $.expression),
+-      _class_const_element: $ => seq(reserved('nothing', $.name), '=', $.expression),
++      _class_const_element: $ => seq(choice(reserved('nothing', $.name), alias($.boolean, $.name)), '=', $.expression),
+ 
+       echo_statement: $ => seq(keyword('echo'), $._expressions, $._semicolon),
+ 
+       exit_statement: $ => seq(
+         keyword('exit'),
+-        optional(seq('(', optional($.expression), ')')),
++        optional(choice(seq('(', ')'), $.expression)),
+         $._semicolon,
+       ),
+ 
+@@ -1077,6 +1080,7 @@
+         field('type', $.cast_type),
+         ')',
+         field('value', choice(
++          $.match_expression,
+           $._unary_expression,
+           $.include_expression,
+           $.include_once_expression,
+@@ -1370,7 +1374,7 @@
+       _simple_string_member_access_expression: $ => prec(PREC.MEMBER, seq(
+         field('object', $.variable_name),
+         '->',
+-        field('name', $.name),
++        field('name', reserved('nothing', $.name)),
+       )),
+ 
+       _simple_string_subscript_unary_expression: $ => prec.left(seq('-', $.integer)),
