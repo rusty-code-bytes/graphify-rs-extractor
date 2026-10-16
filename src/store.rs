@@ -32,7 +32,8 @@ impl Store {
             CREATE TABLE opaque_traits(owner TEXT PRIMARY KEY);
             CREATE TABLE methods(owner TEXT, name TEXT, id TEXT, PRIMARY KEY(owner,name,id));
             CREATE TABLE refs(source TEXT, domain TEXT, name TEXT, fallback TEXT, relation TEXT,
-                              file TEXT, line INTEGER, confidence TEXT NOT NULL);
+                              file TEXT, line INTEGER, confidence TEXT NOT NULL, event INTEGER NOT NULL);
+            CREATE TABLE php_requires(source TEXT, file TEXT, event INTEGER, target TEXT, line INTEGER);
             CREATE TABLE edges(source TEXT, target TEXT, relation TEXT, file TEXT, line INTEGER, confidence TEXT NOT NULL,
                                PRIMARY KEY(source,target,relation));
             ",
@@ -55,6 +56,7 @@ impl Store {
             "opaque_traits",
             "methods",
             "refs",
+            "php_requires",
             "edges",
         ] {
             self.conn.execute_batch(&format!(
@@ -79,6 +81,7 @@ impl Store {
             "opaque_traits",
             "methods",
             "refs",
+            "php_requires",
             "edges",
         ] {
             self.conn.execute_batch(&format!("DELETE FROM {table}"))?;
@@ -163,10 +166,42 @@ impl Store {
             (domain, "EXTRACTED")
         };
         self.conn
-            .prepare_cached("INSERT INTO refs VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")?
+            .prepare_cached("INSERT INTO refs VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0)")?
             .execute(params![
                 source, domain, name, fallback, relation, file, line, confidence
             ])?;
+        Ok(())
+    }
+    /// A byte event belongs to one executing scope. Zero denotes an expression
+    /// whose evaluation order/control flow is outside the bounded proof model.
+    #[allow(clippy::too_many_arguments)]
+    pub fn php_function_reference(
+        &self,
+        source: &str,
+        name: &str,
+        fallback: Option<&str>,
+        file: &str,
+        line: usize,
+        event: usize,
+    ) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "INSERT INTO refs VALUES(?1,'php-function',?2,?3,'calls',?4,?5,'EXTRACTED',?6)",
+            )?
+            .execute(params![source, name, fallback, file, line, event])?;
+        Ok(())
+    }
+    pub fn php_require(
+        &self,
+        source: &str,
+        file: &str,
+        event: usize,
+        target: &str,
+        line: usize,
+    ) -> Result<()> {
+        self.conn
+            .prepare_cached("INSERT INTO php_requires VALUES(?1,?2,?3,?4,?5)")?
+            .execute(params![source, file, event, target, line])?;
         Ok(())
     }
     pub fn opaque_traits(&self, owner: &str) -> Result<()> {
@@ -324,6 +359,7 @@ impl Store {
             "CREATE INDEX sql_defs_lookup ON sql_defs(file,name);
             CREATE INDEX refs_lookup ON refs(domain,name);
             CREATE INDEX php_include_refs ON refs(file,name) WHERE domain='file';
+            CREATE INDEX php_requires_lookup ON php_requires(source,file,event);
             CREATE INDEX refs_owner ON refs(source,relation);
             CREATE INDEX nodes_file ON nodes(file);",
         )?;
@@ -484,7 +520,7 @@ impl Store {
              JOIN autoload_reachable_files f ON f.context=c.context
              LEFT JOIN php_file_contexts visible ON visible.file=f.file
              WHERE visible.file IS NULL OR EXISTS(SELECT 1 FROM symbols uncertain
-              WHERE uncertain.domain='php-loader-unknown' AND uncertain.name=f.file)
+              WHERE uncertain.domain IN ('php-loader-unknown-init','php-loader-unknown-deferred') AND uncertain.name=f.file)
              GROUP BY names.context;
              CREATE UNIQUE INDEX function_unknown_sources_lookup ON function_unknown_sources(context);
              CREATE TABLE function_evidence AS
@@ -532,35 +568,50 @@ impl Store {
              LEFT JOIN local_symbols l ON l.domain='php-class' AND l.name=r.name AND l.file=r.file
              LEFT JOIN class_bindings b ON b.context=f.context AND b.name=r.name
              WHERE r.domain='php-class' AND (l.count=1 OR (l.count IS NULL AND b.id IS NOT NULL));
+             -- Same executable scope, preceding completed require, exact visible
+             -- file identity and an unconditional declaration form a stronger
+             -- proof than context-wide inventory guesses. Facts grow with source
+             -- events, rather than copying all active files into every call.
+             CREATE TABLE php_extracted_files AS
+             SELECT file FROM nodes WHERE json_extract(json,'$.type')='file' AND json_extract(json,'$.language')='php';
+             CREATE UNIQUE INDEX php_extracted_files_lookup ON php_extracted_files(file);
+             CREATE TABLE php_activation_choices AS
+             SELECT r.rowid AS ref,p.name,MIN(p.id) AS id,COUNT(DISTINCT p.id) AS count,
+              MIN(q.target) AS required_file,MIN(q.event) AS require_event,r.event AS call_event,
+              'same-scope-require-unconditional' AS cause
+             FROM refs r JOIN php_requires q ON q.source=r.source AND q.file=r.file AND q.event<r.event
+             JOIN php_extracted_files required ON required.file=q.target
+             JOIN php_candidates p ON p.file=q.target AND p.domain='php-function'
+              AND p.name=r.name
+             WHERE r.domain='php-function' AND r.event>0
+              AND NOT EXISTS(SELECT 1 FROM local_symbols l WHERE l.domain='php-function' AND l.name=r.name AND l.file=r.file)
+             GROUP BY r.rowid,p.name;
+             CREATE UNIQUE INDEX php_activation_choices_lookup ON php_activation_choices(ref,name);
              INSERT INTO resolved_refs
+             SELECT r.rowid,a.id FROM refs r JOIN php_activation_choices a ON a.ref=r.rowid AND a.name=r.name
+             WHERE a.count=1;
+             INSERT OR IGNORE INTO resolved_refs
              SELECT r.rowid,CASE WHEN l.count IS NOT NULL THEN l.id ELSE u.id END
              FROM refs r JOIN php_file_contexts f ON f.file=r.file
              LEFT JOIN local_symbols l ON l.domain='php-function' AND l.name=r.name AND l.file=r.file
              LEFT JOIN function_bindings u ON u.context=f.context AND u.name=r.name
-             WHERE r.domain='php-function' AND (l.count=1 OR (l.count IS NULL AND u.id IS NOT NULL));
-             -- A preceding definite require suppresses local runtime alternatives
-             -- only when it identifies the sole unconditional declaration. A
-             -- conditional declaration in another file remains ambiguous.
-             INSERT OR IGNORE INTO resolved_refs
-             SELECT r.rowid,u.id FROM refs r JOIN php_file_contexts f ON f.file=r.file
-             JOIN php_unique_symbols u ON u.scope=f.scope AND u.domain='php-function' AND u.name=r.name AND u.count=1
-             JOIN nodes target ON target.id=u.id
-             JOIN local_symbols guarded ON guarded.domain='php-function-conditional' AND guarded.name=r.name AND guarded.file=r.file
-             JOIN refs requirement ON requirement.domain='file' AND requirement.name=target.file AND requirement.file=r.file AND requirement.relation='includes:definite'
-             JOIN nodes owner ON owner.id=requirement.source AND owner.file=r.file AND json_extract(owner.json,'$.type')='file'
-             JOIN resolved_refs included ON included.ref=requirement.rowid
-             JOIN nodes required ON required.id=included.target AND required.file=target.file AND json_extract(required.json,'$.type')='file'
-             WHERE r.domain='php-function' AND r.line>requirement.line
-              AND NOT EXISTS(SELECT 1 FROM function_unknown_sources unknown WHERE unknown.context=f.context)
-              AND NOT EXISTS(SELECT 1 FROM php_candidates p WHERE p.scope=f.scope AND p.domain='php-function-conditional' AND p.name=r.name
-               AND (p.file!=r.file OR p.line<=requirement.line));
+             WHERE r.domain='php-function' AND (l.count=1 OR (l.count IS NULL AND u.id IS NOT NULL))
+              AND (l.count=1 OR NOT EXISTS(SELECT 1 FROM php_activation_choices a WHERE a.ref=r.rowid AND a.name=r.name AND a.count!=1))
+              AND (l.count=1 OR NOT EXISTS(SELECT 1 FROM php_requires q WHERE q.source=r.source AND q.file=r.file AND q.event<r.event
+               AND NOT EXISTS(SELECT 1 FROM php_extracted_files n WHERE n.file=q.target)));
+             -- Strong proof resolves exact primary names only. Global namespace
+             -- fallback requires additional absence evidence, including ordinary
+             -- runtime loaders that are outside Composer inventories.
              INSERT OR IGNORE INTO resolved_refs
              SELECT r.rowid,CASE WHEN l.count IS NOT NULL THEN l.id ELSE u.id END
              FROM refs r JOIN php_file_contexts f ON f.file=r.file
              LEFT JOIN local_symbols l ON l.domain='php-function' AND l.name=r.fallback AND l.file=r.file
              LEFT JOIN function_bindings u ON u.context=f.context AND u.name=r.fallback
              WHERE r.domain='php-function' AND (l.count=1 OR (l.count IS NULL AND u.id IS NOT NULL))
-              AND NOT EXISTS(SELECT 1 FROM function_bindings s WHERE s.context=f.context AND s.name=r.name AND s.exists_name);
+              AND NOT EXISTS(SELECT 1 FROM function_bindings s WHERE s.context=f.context AND s.name=r.name AND s.exists_name)
+              AND NOT EXISTS(SELECT 1 FROM php_activation_choices a WHERE a.ref=r.rowid AND a.name=r.fallback AND a.count!=1)
+              AND NOT EXISTS(SELECT 1 FROM php_requires q WHERE q.source=r.source AND q.file=r.file AND q.event<r.event
+               AND NOT EXISTS(SELECT 1 FROM php_extracted_files n WHERE n.file=q.target));
              CREATE TABLE sql_candidates AS
              SELECT 'sql-relation' AS domain,d.file,d.name,d.id FROM sql_defs d
              UNION ALL SELECT 'sql-table',d.file,d.name,d.id FROM sql_defs d JOIN nodes n ON n.id=d.id

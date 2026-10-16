@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-const FORMAT: u64 = 1;
+const FORMAT: u64 = 3;
 pub(crate) const DATABASE: &str = "raw-facts-v1.sqlite3";
 
 // SQLite has one writer. Queue only the existing bounded worker set here rather
@@ -104,6 +104,7 @@ pub(crate) struct FileStats {
     files: u64,
     skipped_sql_data_statements: u64,
     ignored_sql_statements: u64,
+    sql_statement_only: u64,
     dynamic_php_references: u64,
     skipped_html_references: u64,
     unsupported_hack_files: u64,
@@ -115,6 +116,7 @@ impl FileStats {
             files: stats.files,
             skipped_sql_data_statements: stats.skipped_sql_data_statements,
             ignored_sql_statements: stats.ignored_sql_statements,
+            sql_statement_only: stats.sql_statement_only,
             dynamic_php_references: stats.dynamic_php_references,
             skipped_html_references: stats.skipped_html_references,
             unsupported_hack_files: stats.unsupported_hack_files,
@@ -128,6 +130,7 @@ impl FileStats {
             skipped_sql_data_statements: after.skipped_sql_data_statements
                 - self.skipped_sql_data_statements,
             ignored_sql_statements: after.ignored_sql_statements - self.ignored_sql_statements,
+            sql_statement_only: after.sql_statement_only - self.sql_statement_only,
             dynamic_php_references: after.dynamic_php_references - self.dynamic_php_references,
             skipped_html_references: after.skipped_html_references - self.skipped_html_references,
             unsupported_hack_files: after.unsupported_hack_files - self.unsupported_hack_files,
@@ -138,6 +141,7 @@ impl FileStats {
         stats.files += self.files;
         stats.skipped_sql_data_statements += self.skipped_sql_data_statements;
         stats.ignored_sql_statements += self.ignored_sql_statements;
+        stats.sql_statement_only += self.sql_statement_only;
         stats.dynamic_php_references += self.dynamic_php_references;
         stats.skipped_html_references += self.skipped_html_references;
         stats.unsupported_hack_files += self.unsupported_hack_files;
@@ -217,6 +221,9 @@ fn fingerprint() -> &'static [u8; 32] {
             include_bytes!("scheduler.rs").as_slice(),
             include_bytes!("php.rs").as_slice(),
             include_bytes!("sql.rs").as_slice(),
+            include_bytes!("sql/mysql_expressions.rs").as_slice(),
+            include_bytes!("sql/mysql_programs.rs").as_slice(),
+            include_bytes!("sql/mysql_modes.rs").as_slice(),
             include_bytes!("html.rs").as_slice(),
             include_bytes!("model.rs").as_slice(),
             include_bytes!("store.rs").as_slice(),
@@ -242,7 +249,7 @@ struct Table {
     name: &'static str,
     definition: &'static str,
     columns: &'static [&'static str],
-    integer_column: Option<usize>,
+    integer_columns: &'static [usize],
     nullable_column: Option<usize>,
 }
 
@@ -251,47 +258,47 @@ const TABLES: &[Table] = &[
         name: "nodes",
         definition: "id TEXT PRIMARY KEY, file TEXT NOT NULL, json TEXT NOT NULL",
         columns: &["id", "file", "json"],
-        integer_column: None,
+        integer_columns: &[],
         nullable_column: None,
     },
     Table {
         name: "sql_files",
         definition: "file TEXT PRIMARY KEY, dialect TEXT, scope TEXT, role TEXT",
         columns: &["file", "dialect", "scope", "role"],
-        integer_column: None,
+        integer_columns: &[],
         nullable_column: None,
     },
     Table {
         name: "sql_defs",
         definition: "file TEXT, name TEXT, id TEXT",
         columns: &["file", "name", "id"],
-        integer_column: None,
+        integer_columns: &[],
         nullable_column: None,
     },
     Table {
         name: "symbols",
         definition: "domain TEXT, name TEXT, id TEXT, PRIMARY KEY(domain,name,id)",
         columns: &["domain", "name", "id"],
-        integer_column: None,
+        integer_columns: &[],
         nullable_column: None,
     },
     Table {
         name: "opaque_traits",
         definition: "owner TEXT PRIMARY KEY",
         columns: &["owner"],
-        integer_column: None,
+        integer_columns: &[],
         nullable_column: None,
     },
     Table {
         name: "methods",
         definition: "owner TEXT, name TEXT, id TEXT, PRIMARY KEY(owner,name,id)",
         columns: &["owner", "name", "id"],
-        integer_column: None,
+        integer_columns: &[],
         nullable_column: None,
     },
     Table {
         name: "refs",
-        definition: "source TEXT, domain TEXT, name TEXT, fallback TEXT, relation TEXT, file TEXT, line INTEGER, confidence TEXT NOT NULL",
+        definition: "source TEXT, domain TEXT, name TEXT, fallback TEXT, relation TEXT, file TEXT, line INTEGER, confidence TEXT NOT NULL, event INTEGER NOT NULL",
         columns: &[
             "source",
             "domain",
@@ -301,15 +308,23 @@ const TABLES: &[Table] = &[
             "file",
             "line",
             "confidence",
+            "event",
         ],
-        integer_column: Some(6),
+        integer_columns: &[6, 8],
         nullable_column: Some(3),
+    },
+    Table {
+        name: "php_requires",
+        definition: "source TEXT, file TEXT, event INTEGER, target TEXT, line INTEGER",
+        columns: &["source", "file", "event", "target", "line"],
+        integer_columns: &[2, 4],
+        nullable_column: None,
     },
     Table {
         name: "edges",
         definition: "source TEXT, target TEXT, relation TEXT, file TEXT, line INTEGER, confidence TEXT NOT NULL, PRIMARY KEY(source,target,relation)",
         columns: &["source", "target", "relation", "file", "line", "confidence"],
-        integer_column: Some(4),
+        integer_columns: &[4],
         nullable_column: None,
     },
 ];
@@ -553,7 +568,7 @@ fn decode_payload(table: &Table, payload: &str) -> Result<Vec<rusqlite::types::V
         .into_iter()
         .enumerate()
         .map(|(index, field)| {
-            if Some(index) == table.integer_column {
+            if table.integer_columns.contains(&index) {
                 let value = field
                     .as_i64()
                     .filter(|n| *n >= 0)

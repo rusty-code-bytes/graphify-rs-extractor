@@ -50,7 +50,7 @@ fn guarded_polyfill_cannot_override_a_required_unconditional_declaration() {
     put(
         dir.path(),
         "polyfill.php",
-        "<?php\nrequire_once __DIR__ . '/native.php';\nif (!function_exists('helper')) {\n function helper() {}\n}\nfunction caller() {\n helper();\n}\ncaller();\n",
+        "<?php\nrequire_once __DIR__ . '/native.php';\nif (!function_exists('helper')) {\n function helper() {}\n}\nfunction caller() {\n require_once __DIR__ . '/native.php'; helper();\n}\ncaller();\n",
     );
     let graph = graph(&Options::new(dir.path()));
     let caller = node(&graph, "polyfill.php", "caller", 6);
@@ -126,7 +126,7 @@ fn a_conditional_or_bypassed_require_cannot_prove_a_polyfill_target() {
 }
 
 #[test]
-fn definite_require_proof_does_not_bind_an_earlier_or_same_line_call() {
+fn file_requires_never_activate_deferred_function_bodies_by_text_order() {
     let dir = TempDir::new().unwrap();
     put(dir.path(), "native.php", "<?php\nfunction helper() {}\n");
     put(
@@ -138,13 +138,7 @@ fn definite_require_proof_does_not_bind_an_earlier_or_same_line_call() {
     for (name, line) in [("before", 2), ("same_line", 3)] {
         assert!(edges(&g, node(&g, "polyfill.php", name, line), "calls").is_empty());
     }
-    assert!(linked_at(
-        &g,
-        node(&g, "polyfill.php", "after", 5),
-        node(&g, "native.php", "helper", 2),
-        "calls",
-        5
-    ));
+    assert!(edges(&g, node(&g, "polyfill.php", "after", 5), "calls").is_empty());
 }
 
 #[test]
@@ -569,7 +563,7 @@ fn namespaces_and_same_file_unconditional_helpers_preserve_polyfill_provenance()
     put(
         dir.path(),
         "polyfill.php",
-        "<?php namespace Lib {\nrequire __DIR__ . '/native.php';\nif (!function_exists('Lib\\\\helper')) { function helper() {} }\nfunction caller() { helper(); }\n}\nnamespace Local {\nfunction helper() {}\nif ($runtime) { function helper() {} }\nfunction caller() { helper(); }\n}\n",
+        "<?php namespace Lib {\nrequire __DIR__ . '/native.php';\nif (!function_exists('Lib\\\\helper')) { function helper() {} }\nfunction caller() { require_once __DIR__ . '/native.php'; helper(); }\n}\nnamespace Local {\nfunction helper() {}\nif ($runtime) { function helper() {} }\nfunction caller() { helper(); }\n}\n",
     );
     let g = graph(&Options::new(dir.path()));
     assert!(linked_at(

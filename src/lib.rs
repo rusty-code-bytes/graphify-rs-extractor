@@ -103,6 +103,8 @@ pub struct Stats {
     pub unresolved_references: u64,
     pub skipped_sql_data_statements: u64,
     pub ignored_sql_statements: u64,
+    /// Parsed statements retained without projecting their internal dependencies.
+    pub sql_statement_only: u64,
     pub dynamic_php_references: u64,
     pub skipped_html_references: u64,
     /// Files carrying a Hack opening tag: inventoried explicitly, not parsed as PHP.
@@ -271,6 +273,7 @@ pub fn extract(options: &Options) -> Result<Stats> {
                 stats.files += local.files;
                 stats.skipped_sql_data_statements += local.skipped_sql_data_statements;
                 stats.ignored_sql_statements += local.ignored_sql_statements;
+                stats.sql_statement_only += local.sql_statement_only;
                 stats.dynamic_php_references += local.dynamic_php_references;
                 stats.skipped_html_references += local.skipped_html_references;
                 stats.unsupported_hack_files += local.unsupported_hack_files;
@@ -297,7 +300,9 @@ pub fn extract(options: &Options) -> Result<Stats> {
         "php_resolution": "same-file declarations, then static Composer context and exact qualified symbols; never execute project PHP",
         "php_identifier_encoding": "UTF-8; literal U+F100 doubled, invalid source byte b escaped as U+F100 followed by U+E000+b",
         "limitations": ["no LLM semantics", "no JavaScript extraction", "receiver calls are inferred; runtime dispatch is not fully resolved",
-            "SQL declarations, not executed migration state", "Hack files are inventoried as language=hack, without symbol extraction"]
+            "SQL declarations, not executed migration state",
+            "SQL nodes with extraction_coverage=statement_only do not project internal dependencies",
+            "Hack files are inventoried as language=hack, without symbol extraction"]
     });
     let _export_span = profile::span(|| "export".into());
     let mut temp = tempfile::NamedTempFile::new_in(&out)?;

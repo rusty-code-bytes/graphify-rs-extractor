@@ -13,6 +13,9 @@ pub struct Node {
     pub language: String,
     #[serde(rename = "_origin")]
     pub origin: String,
+    /// Explicitly limited semantic projection; absent for ordinary AST nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction_coverage: Option<String>,
 }
 
 pub fn id(parts: &[&str]) -> String {
@@ -40,6 +43,7 @@ impl Node {
             kind: kind.into(),
             language: language.into(),
             origin: "ast".into(),
+            extraction_coverage: None,
         }
     }
     pub fn file(file: &str, language: &str) -> Self {

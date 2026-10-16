@@ -2,8 +2,9 @@ use crate::{Stats, model::Node, store::Store};
 use anyhow::{Context, Result, bail};
 use sqlparser::{
     ast::{
-        AlterTableOperation, ColumnOption, ObjectName, ObjectNamePart, Query, SetExpr, Statement,
-        TableConstraint, TableFactor, Visit, Visitor,
+        AlterTableOperation, ColumnOption, ConditionalStatements, Declare, DeclareAssignment,
+        DeclareType, Expr, ObjectName, ObjectNamePart, Query, SetExpr, Statement, TableConstraint,
+        TableFactor, Visit, Visitor,
     },
     dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
     keywords::Keyword,
@@ -11,22 +12,262 @@ use sqlparser::{
     tokenizer::{Token, TokenWithSpan, Tokenizer},
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     fs::File,
     io::{BufReader, Bytes, Read},
     ops::ControlFlow,
     path::Path,
 };
 
+mod mysql_expressions;
+mod mysql_modes;
+mod mysql_programs;
+
+// Preserve the MySQL dialect identity and overrides while filling specific
+// grammar gaps. Every MySQL parse uses this wrapper so expression fixes and the
+// current string-escape mode apply consistently, including nested queries.
+#[derive(Debug)]
+struct MySqlProgramDialect(MySqlDialect, bool);
+
+macro_rules! delegate_mysql_flags {
+    ($($method:ident),+ $(,)?) => {
+        $(fn $method(&self) -> bool { self.0.$method() })+
+    };
+}
+
+impl Dialect for MySqlProgramDialect {
+    fn dialect(&self) -> std::any::TypeId {
+        self.0.dialect()
+    }
+    fn is_identifier_start(&self, ch: char) -> bool {
+        self.0.is_identifier_start(ch)
+    }
+    fn is_identifier_part(&self, ch: char) -> bool {
+        self.0.is_identifier_part(ch)
+    }
+    fn is_delimited_identifier_start(&self, ch: char) -> bool {
+        self.0.is_delimited_identifier_start(ch)
+    }
+    fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
+        self.0.identifier_quote_style(identifier)
+    }
+    fn parse_infix(
+        &self,
+        parser: &mut Parser<'_>,
+        expr: &Expr,
+        precedence: u8,
+    ) -> Option<Result<Expr, ParserError>> {
+        mysql_expressions::parse_infix(parser, expr, precedence)
+            .or_else(|| self.0.parse_infix(parser, expr, precedence))
+    }
+    fn parse_prefix(&self, parser: &mut Parser<'_>) -> Option<Result<Expr, ParserError>> {
+        mysql_expressions::parse_prefix(parser).or_else(|| self.0.parse_prefix(parser))
+    }
+    fn get_next_precedence(&self, parser: &Parser<'_>) -> Option<Result<u8, ParserError>> {
+        mysql_expressions::get_next_precedence(parser)
+            .or_else(|| self.0.get_next_precedence(parser))
+    }
+    fn supports_string_literal_backslash_escape(&self) -> bool {
+        !self.1
+    }
+    fn parse_column_option(
+        &self,
+        parser: &mut Parser<'_>,
+    ) -> Result<Option<Result<Option<ColumnOption>, ParserError>>, ParserError> {
+        if matches!(parser.peek_token().token, Token::Word(ref word)
+            if word.quote_style.is_none() && (word.value.eq_ignore_ascii_case("INVISIBLE")
+                || word.value.eq_ignore_ascii_case("VISIBLE")))
+        {
+            return Ok(Some(Ok(Some(ColumnOption::DialectSpecific(vec![
+                parser.next_token().token,
+            ])))));
+        }
+        self.0.parse_column_option(parser)
+    }
+    fn is_table_factor_alias(&self, explicit: bool, kw: &Keyword, parser: &mut Parser<'_>) -> bool {
+        self.0.is_table_factor_alias(explicit, kw, parser)
+    }
+    delegate_mysql_flags!(
+        supports_string_literal_concatenation,
+        ignores_wildcard_escapes,
+        supports_numeric_prefix,
+        require_interval_qualifier,
+        supports_limit_comma,
+        supports_create_table_select,
+        supports_insert_set,
+        supports_user_host_grantee,
+        supports_table_hints,
+        requires_single_line_comment_whitespace,
+        supports_match_against,
+        supports_set_names,
+        supports_comma_separated_set_assignments,
+        supports_data_type_signed_suffix,
+        supports_cross_join_constraint,
+    );
+    fn parse_statement(&self, parser: &mut Parser<'_>) -> Option<Result<Statement, ParserError>> {
+        if parser.parse_keyword(Keyword::DECLARE) {
+            Some(parse_mysql_declare(parser))
+        } else {
+            self.0.parse_statement(parser)
+        }
+    }
+}
+
+fn parse_mysql_declare(parser: &mut Parser<'_>) -> Result<Statement, ParserError> {
+    let names = parser.parse_comma_separated(|parser| {
+        if !matches!(&parser.peek_token().token, Token::Word(word)
+            if !word.value.starts_with('@'))
+        {
+            return parser.expected("a MySQL local variable name", parser.peek_token());
+        }
+        parser.parse_identifier()
+    })?;
+    let mut declaration = Declare {
+        names,
+        data_type: None,
+        assignment: None,
+        declare_type: None,
+        binary: None,
+        sensitive: None,
+        scroll: None,
+        hold: None,
+        for_query: None,
+    };
+    if declaration.names.len() == 1 && parser.parse_keyword(Keyword::CURSOR) {
+        parser.expect_keyword_is(Keyword::FOR)?;
+        declaration.declare_type = Some(DeclareType::Cursor);
+        declaration.for_query = Some(parser.parse_query()?);
+    } else {
+        declaration.data_type = Some(parse_mysql_local_type(parser)?);
+        if parser.parse_keyword(Keyword::DEFAULT) {
+            declaration.assignment =
+                Some(DeclareAssignment::Default(Box::new(parser.parse_expr()?)));
+        }
+    }
+    Ok(Statement::Declare {
+        stmts: vec![declaration],
+    })
+}
+
+fn parse_mysql_local_type(
+    parser: &mut Parser<'_>,
+) -> Result<sqlparser::ast::DataType, ParserError> {
+    // MySQL has no user-defined local variable types. Do not let the generic
+    // parser treat missing types (e.g. DEFAULT) as arbitrary custom names.
+    if !matches!(&parser.peek_token().token, Token::Word(word)
+        if word.quote_style.is_none() && matches!(word.keyword,
+            Keyword::BIT | Keyword::TINYINT | Keyword::SMALLINT | Keyword::MEDIUMINT
+            | Keyword::INT | Keyword::INTEGER | Keyword::BIGINT | Keyword::REAL
+            | Keyword::DOUBLE | Keyword::FLOAT | Keyword::DECIMAL | Keyword::DEC
+            | Keyword::NUMERIC | Keyword::DATE | Keyword::TIME | Keyword::TIMESTAMP
+            | Keyword::DATETIME | Keyword::YEAR | Keyword::CHAR | Keyword::CHARACTER
+            | Keyword::VARCHAR | Keyword::BINARY | Keyword::VARBINARY | Keyword::TINYBLOB
+            | Keyword::BLOB | Keyword::MEDIUMBLOB | Keyword::LONGBLOB | Keyword::TINYTEXT
+            | Keyword::TEXT | Keyword::MEDIUMTEXT | Keyword::LONGTEXT | Keyword::ENUM
+            | Keyword::SET | Keyword::JSON | Keyword::BOOL | Keyword::BOOLEAN))
+    {
+        return parser.expected("a supported MySQL local variable type", parser.peek_token());
+    }
+    parser.parse_data_type()
+}
+
+// The parser's DECLARE hook has no enclosing-block context. Validate the AST
+// after parsing so the compatibility path cannot admit declarations at file
+// scope, in an IF branch, or after executable statements. Nested declaration
+// blocks need the full mysql_programs grammar: the native conditional parser
+// does not enforce MySQL's required semicolon after the nested END.
+fn validate_mysql_declarations(statements: &[Statement]) -> Result<(), ParserError> {
+    fn block(body: &ConditionalStatements) -> Result<usize, ParserError> {
+        if !matches!(body, ConditionalStatements::BeginEnd(_)) {
+            return Ok(0);
+        }
+        let mut count = 0;
+        let mut executable = false;
+        let mut cursor = false;
+        let mut names = HashSet::new();
+        for statement in body.statements() {
+            let Statement::Declare { stmts } = statement else {
+                executable = true;
+                continue;
+            };
+            count += 1;
+            for declaration in stmts {
+                for name in &declaration.names {
+                    let message = if executable {
+                        Some("MySQL DECLARE must precede executable statements")
+                    } else if cursor && declaration.data_type.is_some() {
+                        Some("MySQL local variables must precede cursor declarations")
+                    } else if !names.insert((
+                        declaration.declare_type.is_some(),
+                        name.value.to_lowercase(),
+                    )) {
+                        Some("duplicate MySQL local declaration")
+                    } else {
+                        None
+                    };
+                    if let Some(message) = message {
+                        return Err(ParserError::ParserError(format!(
+                            "{message} at Line: {}, Column: {}",
+                            name.span.start.line, name.span.start.column
+                        )));
+                    }
+                }
+                cursor |= declaration.declare_type == Some(DeclareType::Cursor);
+            }
+        }
+        Ok(count)
+    }
+    #[derive(Default)]
+    struct Declarations {
+        scoped: usize,
+        total: usize,
+    }
+    impl Visitor for Declarations {
+        type Break = ParserError;
+        fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
+            let body = match statement {
+                Statement::CreateTrigger(trigger) => trigger.statements.as_ref(),
+                Statement::CreateProcedure { body, .. } => Some(body),
+                Statement::Declare { .. } => {
+                    self.total += 1;
+                    None
+                }
+                _ => None,
+            };
+            if let Some(body) = body {
+                match block(body) {
+                    Ok(count) => self.scoped += count,
+                    Err(error) => return ControlFlow::Break(error),
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut declarations = Declarations::default();
+    for statement in statements {
+        if let ControlFlow::Break(error) = statement.visit(&mut declarations) {
+            return Err(error);
+        }
+    }
+    if declarations.total != declarations.scoped {
+        return Err(ParserError::ParserError(
+            "MySQL DECLARE requires the start of the trigger/procedure BEGIN/END block; nested declaration blocks are unsupported".into(),
+        ));
+    }
+    Ok(())
+}
+
 // MySQL permits INSERT ... VALUE as a synonym for VALUES, but sqlparser 0.59
 // only accepts VALUES. Locate that token through the INSERT header grammar:
 // identifiers, expressions, strings and quoted VALUE tokens must stay intact.
 // Keep original spans so the compatibility retry cannot shift query provenance.
-fn mysql_insert_value_tokens(sql: &str) -> Result<Option<Vec<TokenWithSpan>>, ParserError> {
-    let dialect = MySqlDialect {};
-    let tokens = Tokenizer::new(&dialect, sql).tokenize_with_location()?;
+fn mysql_insert_value_tokens(
+    dialect: &dyn Dialect,
+    sql: &str,
+) -> Result<Option<Vec<TokenWithSpan>>, ParserError> {
+    let tokens = Tokenizer::new(dialect, sql).tokenize_with_location()?;
     let token_count = tokens.len();
-    let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens);
+    let mut parser = Parser::new(dialect).with_tokens_with_locations(tokens);
     let mut positions = Vec::new();
     while parser.peek_token().token != Token::EOF {
         if !parser.parse_keyword(Keyword::INSERT) {
@@ -71,23 +312,65 @@ fn parse_schema_statement(
     dialect: &dyn Dialect,
     dialect_name: &str,
     sql: &str,
+    no_backslash_escapes: bool,
 ) -> Result<Vec<Statement>, ParserError> {
-    let parsed = Parser::parse_sql(dialect, sql);
-    if parsed.is_ok() || dialect_name != "mysql" {
-        return parsed;
+    if dialect_name != "mysql" {
+        return Parser::parse_sql(dialect, sql);
     }
-    match mysql_insert_value_tokens(sql)? {
-        Some(tokens) => Parser::new(dialect)
+    let mysql = MySqlProgramDialect(MySqlDialect {}, no_backslash_escapes);
+    let statements = match mysql_insert_value_tokens(&mysql, sql)? {
+        Some(tokens) => Parser::new(&mysql)
             .with_tokens_with_locations(tokens)
             .parse_statements(),
-        None => parsed,
+        None => Parser::parse_sql(&mysql, sql),
+    }?;
+    validate_mysql_declarations(&statements)?;
+    mysql_expressions::validate(&statements)?;
+    validate_mysql_visibility(&statements)?;
+    Ok(statements)
+}
+
+fn validate_mysql_visibility(statements: &[Statement]) -> Result<(), ParserError> {
+    for statement in statements {
+        let Statement::CreateTable(table) = statement else {
+            continue;
+        };
+        let mut visible = false;
+        for column in &table.columns {
+            let mut visibility = None;
+            for option in &column.options {
+                if let ColumnOption::DialectSpecific(tokens) = &option.option {
+                    for token in tokens {
+                        if let Token::Word(word) = token
+                            && (word.value.eq_ignore_ascii_case("INVISIBLE")
+                                || word.value.eq_ignore_ascii_case("VISIBLE"))
+                        {
+                            if visibility.is_some() {
+                                return Err(ParserError::ParserError(format!(
+                                    "duplicate column visibility at Line: {}, Column: {}",
+                                    column.name.span.start.line, column.name.span.start.column
+                                )));
+                            }
+                            visibility = Some(word.value.eq_ignore_ascii_case("VISIBLE"));
+                        }
+                    }
+                }
+            }
+            visible |= visibility != Some(false);
+        }
+        if !table.columns.is_empty() && !visible {
+            return Err(ParserError::ParserError(
+                "MySQL tables require a visible column".into(),
+            ));
+        }
     }
+    Ok(())
 }
 
 // Account-management statements have no table/schema projection. sqlparser's
 // generic CREATE USER grammar does not accept MySQL's user@host form. Validate
 // the supported complete syntax before counting it as intentionally ignored.
-fn mysql_account_control(sql: &str) -> Result<bool> {
+fn mysql_account_control(dialect: &dyn Dialect, sql: &str) -> Result<bool> {
     fn word(parser: &mut Parser<'_>, value: &str) -> bool {
         if matches!(parser.peek_token().token, Token::Word(ref w)
             if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(value))
@@ -117,8 +400,7 @@ fn mysql_account_control(sql: &str) -> Result<bool> {
         }
         Ok(())
     }
-    let dialect = MySqlDialect {};
-    let mut parser = Parser::new(&dialect).try_with_sql(sql)?;
+    let mut parser = Parser::new(dialect).try_with_sql(sql)?;
     if parser.parse_keywords(&[Keyword::CREATE, Keyword::USER]) {
         if word(&mut parser, "IF") {
             expect_word(&mut parser, "NOT")?;
@@ -360,7 +642,7 @@ fn statements<R: Read>(
     dialect: &str,
     ansi_comments: bool,
     limit: usize,
-    mut emit: impl FnMut(&[u8], usize, bool) -> Result<()>,
+    mut emit: impl FnMut(&[u8], usize, bool, bool) -> Result<()>,
 ) -> Result<()> {
     let mut input = Input::new(reader);
     let mut buffer = Vec::new();
@@ -369,6 +651,7 @@ fn statements<R: Read>(
     let mut line = 1;
     let mut delimiter = b";".to_vec();
     let mut executable_comment = false;
+    let mut modes = mysql_modes::MysqlModes::default();
     while let Some(b) = input.peek(0)? {
         if buffer.is_empty() && !skip && b.is_ascii_whitespace() {
             input.next()?;
@@ -393,9 +676,17 @@ fn statements<R: Read>(
                 bail!("binary COPY input is not supported; export a text SQL dump");
             }
             if skip || is_copy {
-                emit(&[], line, true)?;
+                emit(&[], line, true, modes.no_backslash_escapes())?;
             } else if !buffer.iter().all(u8::is_ascii_whitespace) {
-                emit(&buffer, line, false)?;
+                let no_backslash = modes.no_backslash_escapes();
+                if dialect == "mysql" {
+                    let sql = std::str::from_utf8(&buffer)
+                        .context("SQL schema statements must be UTF-8")?;
+                    modes
+                        .apply(sql, &MySqlProgramDialect(MySqlDialect {}, no_backslash))
+                        .with_context(|| format!("MySQL session setting near line {line}"))?;
+                }
+                emit(&buffer, line, false, no_backslash)?;
             }
             buffer.clear();
             skip = false;
@@ -480,17 +771,13 @@ fn statements<R: Read>(
                     if c == b'\n' {
                         break;
                     }
-                    if value.len() >= 64 {
-                        bail!("invalid SQL DELIMITER");
+                    // mysql's com_delimiter copies the full command into a
+                    // 255-byte buffer before parsing its first argument.
+                    if value.len() < 255 - "DELIMITER".len() {
+                        value.push(c);
                     }
-                    value.push(c);
                 }
-                let value = std::str::from_utf8(&value)?.trim().as_bytes();
-                if value.is_empty() || value.len() > 16 || value.iter().any(u8::is_ascii_whitespace)
-                {
-                    bail!("invalid SQL DELIMITER");
-                }
-                delimiter = value.to_vec();
+                delimiter = mysql_modes::delimiter(&value)?;
                 buffer.clear();
                 continue;
             }
@@ -500,9 +787,14 @@ fn statements<R: Read>(
             }
             first_word_done = true;
         }
+        // Data payloads are streamed without building an AST. An assignment
+        // outside a quoted literal makes saved session values unknowable.
+        if dialect == "mysql" && skip && input.starts(b":=")? {
+            modes.invalidate_saved();
+        }
         if matches!(b, b'\'' | b'"' | b'`') || (b == b'[' && dialect == "sqlite") {
             let quote = if b == b'[' { b']' } else { b };
-            let backslash = dialect == "mysql"
+            let backslash = (dialect == "mysql" && b != b'`' && !modes.no_backslash_escapes())
                 || (dialect == "postgres" && b == b'\'' && matches!(input.previous, b'e' | b'E'));
             input.next()?;
             append(&mut buffer, b, skip, limit)?;
@@ -571,9 +863,17 @@ fn statements<R: Read>(
         bail!("unterminated executable SQL comment");
     }
     if skip {
-        emit(&[], line, true)?;
+        emit(&[], line, true, modes.no_backslash_escapes())?;
     } else if !buffer.iter().all(u8::is_ascii_whitespace) {
-        emit(&buffer, line, false)?;
+        let no_backslash = modes.no_backslash_escapes();
+        if dialect == "mysql" {
+            let sql =
+                std::str::from_utf8(&buffer).context("SQL schema statements must be UTF-8")?;
+            modes
+                .apply(sql, &MySqlProgramDialect(MySqlDialect {}, no_backslash))
+                .with_context(|| format!("MySQL session setting near line {line}"))?;
+        }
+        emit(&buffer, line, false, no_backslash)?;
     }
     Ok(())
 }
@@ -758,18 +1058,24 @@ pub fn extract(
         dialect_name,
         ansi_comments,
         limit,
-        |bytes, line, skipped| {
+        |bytes, line, skipped, no_backslash_escapes| {
             if skipped {
                 stats.skipped_sql_data_statements += 1;
                 return Ok(());
             }
             let sql = std::str::from_utf8(bytes).context("SQL schema statements must be UTF-8")?;
+            let mysql_dialect = MySqlProgramDialect(MySqlDialect {}, no_backslash_escapes);
+            let current_dialect: &dyn Dialect = if dialect_name == "mysql" {
+                &mysql_dialect
+            } else {
+                dialect.as_ref()
+            };
             let keyword = sql
                 .split_whitespace()
                 .next()
                 .unwrap_or("")
                 .to_ascii_uppercase();
-            if dialect_name == "mysql" && mysql_account_control(sql)? {
+            if dialect_name == "mysql" && mysql_account_control(&mysql_dialect, sql)? {
                 stats.ignored_sql_statements += 1;
                 return Ok(());
             }
@@ -788,10 +1094,7 @@ pub fn extract(
                     | "DELETE"
                     | "TRUNCATE"
             ) {
-                if sql.to_ascii_lowercase().contains("search_path")
-                    || sql.to_ascii_lowercase().contains("sql_mode")
-                        && sql.to_ascii_uppercase().contains("NO_BACKSLASH_ESCAPES")
-                {
+                if sql.to_ascii_lowercase().contains("search_path") {
                     bail!(
                         "session setting changes SQL resolution/lexing near line {line}; normalize the dump first"
                     );
@@ -800,7 +1103,7 @@ pub fn extract(
                 return Ok(());
             }
             if keyword == "USE" {
-                let parsed = Parser::parse_sql(dialect.as_ref(), sql)
+                let parsed = Parser::parse_sql(current_dialect, sql)
                     .with_context(|| format!("SQL parse near line {line}"))?;
                 if parsed.len() != 1 {
                     bail!("invalid USE statement");
@@ -816,7 +1119,7 @@ pub fn extract(
             }
             // sqlparser 0.59 does not cover these valid vendor statements. Parse their
             // complete token structure rather than dropping arbitrary failed statements.
-            let mut extra = Parser::new(dialect.as_ref()).try_with_sql(sql)?;
+            let mut extra = Parser::new(current_dialect).try_with_sql(sql)?;
             if dialect_name == "postgres"
                 && extra.parse_keywords(&[Keyword::CREATE, Keyword::LANGUAGE])
             {
@@ -829,7 +1132,7 @@ pub fn extract(
                 store.edge(file_id, &node.id, "defines", file, line)?;
                 return Ok(());
             }
-            let mut extra = Parser::new(dialect.as_ref()).try_with_sql(sql)?;
+            let mut extra = Parser::new(current_dialect).try_with_sql(sql)?;
             if dialect_name == "mysql" && extra.parse_keywords(&[Keyword::ALTER, Keyword::TABLE]) {
                 let name = extra.parse_object_name(false)?;
                 let action = if extra.parse_keywords(&[Keyword::DISABLE, Keyword::KEYS]) {
@@ -883,8 +1186,41 @@ pub fn extract(
                     return Ok(());
                 }
             }
-            let statements = parse_schema_statement(dialect.as_ref(), dialect_name, sql)
-                .with_context(|| format!("SQL parse near line {line}"))?;
+            let program = dialect_name == "mysql"
+                && mysql_programs::validate(&mysql_dialect, sql)
+                    .with_context(|| format!("MySQL stored-program parse near line {line}"))?;
+            let parsed =
+                parse_schema_statement(dialect.as_ref(), dialect_name, sql, no_backslash_escapes);
+            let statements = match parsed {
+                Ok(statements) => statements,
+                // The fallback is available only after the entire program has
+                // passed the explicit grammar, DML and expression checks above.
+                Err(_) if program => {
+                    let mut node = Node::new(
+                        file,
+                        "sql_statement",
+                        &format!(
+                            "{}@{line}",
+                            sql.split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                                .chars()
+                                .take(160)
+                                .collect::<String>()
+                        ),
+                        "sql",
+                        line,
+                    );
+                    node.extraction_coverage = Some("statement_only".into());
+                    stats.sql_statement_only += 1;
+                    store.node(&node)?;
+                    store.edge(file_id, &node.id, "contains", file, line)?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("SQL parse near line {line}"));
+                }
+            };
             let key = |name: &ObjectName| -> Result<String> {
                 let raw = object_key(name, dialect_name)?;
                 if name.0.len() == 1
@@ -1063,7 +1399,7 @@ pub fn extract(
                     other => {
                         // Preserve unsupported-but-parsed statements as explicit statement nodes.
                         // No silently invented relationships or false claim of full SQL semantics.
-                        let node = Node::new(
+                        let mut node = Node::new(
                             file,
                             "sql_statement",
                             &format!(
@@ -1073,6 +1409,8 @@ pub fn extract(
                             "sql",
                             line,
                         );
+                        node.extraction_coverage = Some("statement_only".into());
+                        stats.sql_statement_only += 1;
                         store.node(&node)?;
                         store.edge(file_id, &node.id, "contains", file, line)?;
                     }
@@ -1086,6 +1424,137 @@ pub fn extract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mysql_local_declarations_retain_ast_types_defaults_and_spans() {
+        let sql = "CREATE TRIGGER t AFTER UPDATE ON source FOR EACH ROW BEGIN\n\
+  DECLARE vBalance DECIMAL(18,2);\n\
+  DECLARE vDate DATE DEFAULT current_date();\n\
+  DECLARE vOldCase, vNewCase INT SIGNED DEFAULT (9 DIV 2);\n\
+  DECLARE `value` VARCHAR(32) DEFAULT 'it\\'s' ' concatenated';\n\
+  DECLARE rows_cursor CURSOR FOR SELECT id FROM source LIMIT 1, 2;\n\
+  SET vOldCase = 0, vNewCase = 1;\n\
+  INSERT INTO `value` SET `value` = 0x12, note = 'quoted\\'text';\n\
+  SELECT `value` FROM `value` USE INDEX (idx) WHERE `value` = 1 DIV 2 LIMIT 1, 2;\n\
+END";
+        assert!(Parser::parse_sql(&MySqlDialect {}, sql).is_err());
+        let statements = parse_schema_statement(&MySqlDialect {}, "mysql", sql, false).unwrap();
+        let Statement::CreateTrigger(trigger) = &statements[0] else {
+            panic!("expected trigger");
+        };
+        let body = trigger.statements.as_ref().unwrap().statements();
+        for (index, names, data_type, assignment) in [
+            (0, vec!["vBalance"], "DECIMAL(18,2)", None),
+            (1, vec!["vDate"], "DATE", Some("DEFAULT current_date()")),
+            (
+                2,
+                vec!["vOldCase", "vNewCase"],
+                "INT",
+                Some("DEFAULT (9 DIV 2)"),
+            ),
+            (
+                3,
+                vec!["value"],
+                "VARCHAR(32)",
+                Some("DEFAULT 'it''s concatenated'"),
+            ),
+        ] {
+            let Statement::Declare { stmts } = &body[index] else {
+                panic!("expected local declaration");
+            };
+            assert_eq!(stmts.len(), 1);
+            assert_eq!(
+                stmts[0]
+                    .names
+                    .iter()
+                    .map(|name| name.value.as_str())
+                    .collect::<Vec<_>>(),
+                names
+            );
+            assert_eq!(stmts[0].data_type.as_ref().unwrap().to_string(), data_type);
+            assert_eq!(
+                stmts[0]
+                    .assignment
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref(),
+                assignment
+            );
+            assert_eq!(stmts[0].names[0].span.start.line, index as u64 + 2);
+            assert_eq!(stmts[0].names[0].span.start.column, 9);
+        }
+        let Statement::Declare { stmts } = &body[4] else {
+            panic!("expected cursor declaration after variables");
+        };
+        assert_eq!(stmts[0].declare_type, Some(DeclareType::Cursor));
+        assert_eq!(
+            stmts[0].for_query.as_ref().unwrap().to_string(),
+            "SELECT id FROM source LIMIT 1, 2"
+        );
+        assert_eq!(body.len(), 8);
+    }
+
+    #[test]
+    fn mysql_program_dialect_preserves_existing_mysql_parsing() {
+        let wrapped = MySqlProgramDialect(MySqlDialect {}, false);
+        assert!((&wrapped as &dyn Dialect).is::<MySqlDialect>());
+        for sql in [
+            "SELECT 7 DIV 2, 0x12, 'escaped\\'quote' ' concatenated', `value` FROM `value` USE INDEX (idx) LIMIT 1, 2",
+            "SET x = 1, y = 2",
+            "SET NAMES utf8mb4",
+            "CREATE TABLE `value`(id INT SIGNED, note VARCHAR(8)) AS SELECT 1, 'note'",
+            "INSERT INTO `value` SET id = 1, note = 'note'",
+            "LOCK TABLES source READ",
+            "UNLOCK TABLES",
+            "SELECT MATCH(note) AGAINST('needle') FROM source",
+            "SELECT * FROM source CROSS JOIN other ON source.id = other.id",
+        ] {
+            assert_eq!(
+                Parser::parse_sql(&wrapped, sql).unwrap(),
+                Parser::parse_sql(&MySqlDialect {}, sql).unwrap(),
+                "{sql}"
+            );
+        }
+        let sql = "CREATE TRIGGER t AFTER UPDATE ON source FOR EACH ROW BEGIN DECLARE vBalance DECIMAL(18,2); END";
+        for (name, dialect) in [
+            ("generic", Box::new(GenericDialect {}) as Box<dyn Dialect>),
+            ("postgres", Box::new(PostgreSqlDialect {})),
+            ("sqlite", Box::new(SQLiteDialect {})),
+        ] {
+            assert!(
+                parse_schema_statement(dialect.as_ref(), name, sql, false).is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_declaration_fallback_preserves_error_line_and_column() {
+        for (sql, found) in [
+            (
+                "CREATE TRIGGER t AFTER UPDATE ON source FOR EACH ROW BEGIN\n  DECLARE vBalance DECIMAL(18,);\nEND",
+                ")",
+            ),
+            (
+                "CREATE TRIGGER t AFTER UPDATE ON source FOR EACH ROW BEGIN\n  DECLARE vBalance DECIMAL(18,2);\n  INSERT INTO audit_log VALUE(NEW.id) nonsense;\nEND",
+                "nonsense",
+            ),
+        ] {
+            let error = parse_schema_statement(&MySqlDialect {}, "mysql", sql, false).unwrap_err();
+            let (line_index, line) = sql
+                .lines()
+                .enumerate()
+                .find(|(_, line)| line.contains(found))
+                .unwrap();
+            let column = line.find(found).unwrap() + 1;
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("at Line: {}, Column: {column}", line_index + 1)),
+                "{error}"
+            );
+        }
+    }
 
     #[test]
     fn mysql_insert_value_retry_changes_only_row_source_tokens() {
@@ -1103,7 +1572,7 @@ INSERT audit_log(note) VALUES (concat('VALUE', NEW.value));\n\
 END";
         let dialect = MySqlDialect {};
         assert!(Parser::parse_sql(&dialect, sql).is_err());
-        let parsed = parse_schema_statement(&dialect, "mysql", sql).unwrap();
+        let parsed = parse_schema_statement(&dialect, "mysql", sql, false).unwrap();
         let control = Parser::parse_sql(&dialect, expected).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].to_string(), control[0].to_string());
@@ -1111,7 +1580,9 @@ END";
         let original = Tokenizer::new(&dialect, sql)
             .tokenize_with_location()
             .unwrap();
-        let normalized = mysql_insert_value_tokens(sql).unwrap().unwrap();
+        let normalized = mysql_insert_value_tokens(&MySqlDialect {}, sql)
+            .unwrap()
+            .unwrap();
         assert_eq!(original.len(), normalized.len());
         let mut changes = 0;
         for (before, after) in original.iter().zip(normalized.iter()) {
@@ -1136,23 +1607,28 @@ END";
             "INSERT INTO audit_log VALUES (value(1))",
             "CREATE TABLE value(value INT DEFAULT (value(1)))",
         ] {
-            assert!(mysql_insert_value_tokens(sql).unwrap().is_none(), "{sql}");
+            assert!(
+                mysql_insert_value_tokens(&MySqlDialect {}, sql)
+                    .unwrap()
+                    .is_none(),
+                "{sql}"
+            );
         }
         let sql = "CREATE TRIGGER t AFTER UPDATE ON source FOR EACH ROW BEGIN INSERT INTO audit_log VALUE (NEW.id); END";
-        assert!(parse_schema_statement(&MySqlDialect {}, "mysql", sql).is_ok());
+        assert!(parse_schema_statement(&MySqlDialect {}, "mysql", sql, false).is_ok());
         for (name, dialect) in [
             ("generic", Box::new(GenericDialect {}) as Box<dyn Dialect>),
             ("postgres", Box::new(PostgreSqlDialect {})),
             ("sqlite", Box::new(SQLiteDialect {})),
         ] {
-            assert!(parse_schema_statement(dialect.as_ref(), name, sql).is_err());
+            assert!(parse_schema_statement(dialect.as_ref(), name, sql, false).is_err());
         }
     }
 
     #[test]
     fn mysql_insert_value_retry_keeps_error_columns_after_the_rewritten_token() {
         let sql = "CREATE TRIGGER t AFTER UPDATE ON source FOR EACH ROW BEGIN INSERT INTO audit_log VALUE(NEW.id) nonsense; END";
-        let error = parse_schema_statement(&MySqlDialect {}, "mysql", sql).unwrap_err();
+        let error = parse_schema_statement(&MySqlDialect {}, "mysql", sql, false).unwrap_err();
         let column = sql.find("nonsense").unwrap() + 1;
         assert!(
             error
@@ -1166,7 +1642,7 @@ END";
     fn auto_comments_and_strict_mysql_arithmetic_are_distinct() {
         let sql = b"SELECT 4--1;";
         let mut strict = Vec::new();
-        statements(sql.as_slice(), "mysql", false, 128, |s, _, _| {
+        statements(sql.as_slice(), "mysql", false, 128, |s, _, _, _| {
             strict.push(s.to_vec());
             Ok(())
         })
@@ -1178,7 +1654,7 @@ END";
             "mysql",
             true,
             128,
-            |s, _, _| {
+            |s, _, _, _| {
                 script.push(s.to_vec());
                 Ok(())
             },
@@ -1193,7 +1669,7 @@ END";
             "x".repeat(100_000)
         );
         let mut got = Vec::new();
-        statements(sql.as_bytes(), "mysql", false, 128, |s, _, skip| {
+        statements(sql.as_bytes(), "mysql", false, 128, |s, _, skip, _| {
             got.push((String::from_utf8_lossy(s).into_owned(), skip));
             Ok(())
         })
@@ -1210,7 +1686,7 @@ END";
             "postgres",
             false,
             1024,
-            |_, _, _| {
+            |_, _, _, _| {
                 count += 1;
                 Ok(())
             },
@@ -1218,7 +1694,7 @@ END";
         .unwrap();
         assert_eq!(count, 2);
         let mut count = 0;
-        statements(b"DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT ';'; END$$\nDELIMITER ;\nCREATE TABLE t(x int);".as_slice(),"mysql",false,1024,|_,_,_|{ count+=1; Ok(()) }).unwrap();
+        statements(b"DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT ';'; END$$\nDELIMITER ;\nCREATE TABLE t(x int);".as_slice(),"mysql",false,1024,|_,_,_,_|{ count+=1; Ok(()) }).unwrap();
         assert_eq!(count, 2);
         let mut count = 0;
         statements(
@@ -1226,7 +1702,7 @@ END";
             "postgres",
             false,
             1024,
-            |_, _, _| {
+            |_, _, _, _| {
                 count += 1;
                 Ok(())
             },
@@ -1237,7 +1713,9 @@ END";
     #[test]
     fn malformed_sql_is_not_silently_accepted() {
         for sql in ["INSERT INTO t VALUES ('oops", "/* unfinished", "SELECT $$x"] {
-            assert!(statements(sql.as_bytes(), "postgres", false, 1024, |_, _, _| Ok(())).is_err());
+            assert!(
+                statements(sql.as_bytes(), "postgres", false, 1024, |_, _, _, _| Ok(())).is_err()
+            );
         }
     }
 
@@ -1249,7 +1727,7 @@ END";
             "postgres",
             false,
             128,
-            |_, _, skip| {
+            |_, _, skip, _| {
                 assert!(skip);
                 emitted += 1;
                 Ok(())

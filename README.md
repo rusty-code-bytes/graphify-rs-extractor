@@ -62,6 +62,11 @@ Nested library manifests alone do not establish an active Composer loader;
 runtime loader registration remains a static-analysis limitation. Unknown or
 excluded autoload function sources, including delegated includes, can leave
 external function calls unresolved rather than redirect them to a duplicate.
+An earlier, proven `require` in the same execution scope can resolve an exact
+function even with an unrelated unknown loader. This does not bypass namespace
+fallback ambiguity. Computed include paths are limited to anchored expressions
+and fresh local values before opaque effects; mutable global bootstrap paths
+such as `$CFG->libdir` remain unproven.
 
 ## Filtering
 
@@ -131,6 +136,14 @@ framework migration DSLs are not semantically analyzed. View dependencies respec
 CTE scopes. Unsupported SQL syntax, including `CREATE VIEW ... AS TABLE ...` and
 binary COPY, fails explicitly.
 
+MySQL stored programs are syntax-checked and retained as `sql_statement` nodes.
+Their bodies are not projected into dependency edges: these nodes explicitly
+carry `extraction_coverage: "statement_only"`, counted in `sql_statement_only`.
+An extracted program therefore does not imply complete analysis of its effects.
+Literal `NO_BACKSLASH_ESCAPES` changes and bounded mysqldump mode save/restore
+are supported per file. Unknown mode expressions or invalidated saved values
+fail explicitly; the extractor does not execute stored programs to infer modes.
+
 ## Graphify compatibility and limitations
 
 Output is directed NetworkX node-link JSON with `nodes` and `links`, supporting
@@ -174,6 +187,19 @@ cargo clippy --locked --all-targets -- -D warnings
 Regression tests cover parser behavior, ambiguity, autoload selection, SQL scopes,
 cache invalidation, parallel determinism and export profiles. Repaired scenarios
 retain correct-target, forbidden-target and source-provenance assertions.
+
+The `mysql_*_regressions` suites use the official MySQL 8.4 manual as a syntax
+reference. They cover function expressions, statements and lexical variants,
+with explicit cases for valid but unsupported syntax and atomic failure.
+These are extractor tests, not MySQL server execution or function-result tests.
+Streamed data statements are tested as counted omissions, not syntax validation.
+Run the focused suites with:
+
+```sh
+cargo test --locked --test mysql_function_regressions \
+  --test mysql_statement_regressions --test mysql_lexical_regressions \
+  --test sql_coverage_regressions
+```
 
 Optional official-consumer integration tests require Graphify's Python dependencies:
 

@@ -10,6 +10,8 @@ use std::{
 };
 use tree_sitter::{Node as Ast, Parser};
 
+const MAX_PATH_BYTES: usize = 4096;
+
 /// PHP identifiers are byte strings. Preserve UTF-8 verbatim while giving every
 /// invalid byte a reversible, collision-free spelling accepted by tree-sitter.
 /// U+F100 is reserved: a literal occurrence is doubled, and an invalid byte is
@@ -89,6 +91,15 @@ struct Scope {
     properties: HashMap<String, String>,
     global_hints: HashMap<String, String>,
     owner: String,
+    // Values are local to one straight-line execution scope. Object properties
+    // require a fresh builtin stdClass; any escape or opaque effect forgets them.
+    paths: HashMap<String, (String, bool)>,
+    path_objects: HashSet<String>,
+    path_clean: bool,
+    path_inputs: HashSet<String>,
+    activation_eligible: bool,
+    activation_reachable: bool,
+    deferred: bool,
 }
 
 struct Extractor<'a> {
@@ -96,7 +107,7 @@ struct Extractor<'a> {
     file: &'a str,
     store: &'a Store,
     stats: &'a mut Stats,
-    definite_requires: HashSet<usize>,
+    computed_paths_allowed: bool,
 }
 
 fn children(node: Ast<'_>) -> Vec<Ast<'_>> {
@@ -123,7 +134,69 @@ fn unconditional_function(node: Ast<'_>) -> bool {
     })
 }
 
+fn has_jump(nodes: &[Ast<'_>]) -> bool {
+    let mut pending = nodes.to_vec();
+    while let Some(node) = pending.pop() {
+        if matches!(node.kind(), "goto_statement" | "named_label_statement") {
+            return true;
+        }
+        if !matches!(
+            node.kind(),
+            "function_definition"
+                | "method_declaration"
+                | "anonymous_function"
+                | "arrow_function"
+                | "class_declaration"
+                | "anonymous_class"
+                | "interface_declaration"
+                | "trait_declaration"
+                | "enum_declaration"
+        ) {
+            pending.extend(children(node));
+        }
+    }
+    false
+}
+
+fn has_ticks(root: Ast<'_>, source: &[u8]) -> bool {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "declare_directive"
+            && source[node.byte_range()]
+                .windows(5)
+                .any(|word| word.eq_ignore_ascii_case(b"ticks"))
+        {
+            return true;
+        }
+        pending.extend(children(node));
+    }
+    false
+}
+
 impl Extractor<'_> {
+    fn loader_unknown(&self, scope: &Scope) -> Result<()> {
+        self.store.symbol(
+            if scope.deferred {
+                "php-loader-unknown-deferred"
+            } else {
+                "php-loader-unknown-init"
+            },
+            self.file,
+            &scope.owner,
+        )
+    }
+    fn direct_event(&self, node: Ast<'_>, scope: &Scope) -> usize {
+        if scope.activation_eligible
+            && scope.activation_reachable
+            && node.parent().is_some_and(|parent| {
+                parent.kind() == "expression_statement" && parent.named_child(0) == Some(node)
+            })
+        {
+            node.start_byte() + 1
+        } else {
+            0
+        }
+    }
     fn text(&self, node: Ast<'_>) -> &str {
         std::str::from_utf8(&self.source[node.byte_range()]).unwrap()
     }
@@ -508,6 +581,17 @@ impl Extractor<'_> {
     fn sequence(&mut self, nodes: &[Ast<'_>], mut scope: Scope, depth: usize) -> Result<()> {
         for &node in nodes {
             self.walk(node, &scope, depth + 1)?;
+            self.path_effects(node, &mut scope);
+            if matches!(
+                node.kind(),
+                "return_statement" | "throw_expression" | "exit_statement"
+            ) || node.kind() == "expression_statement"
+                && node
+                    .named_child(0)
+                    .is_some_and(|expression| expression.kind() == "throw_expression")
+            {
+                scope.activation_reachable = false;
+            }
             let (invalid, clear) = self.effects(node, &scope);
             if clear {
                 scope.receivers.clear();
@@ -566,7 +650,86 @@ impl Extractor<'_> {
         }
         result
     }
-    fn include_value(&self, node: Ast<'_>, depth: usize) -> Option<(String, bool)> {
+    fn path_key(&self, node: Ast<'_>, scope: &Scope) -> Option<String> {
+        if node.kind() == "variable_name" {
+            return Some(self.text(node).to_owned());
+        }
+        if node.kind() == "member_access_expression"
+            && let (Some(object), Some(name)) = (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("name"),
+            )
+            && object.kind() == "variable_name"
+            && name.kind() == "name"
+            && scope.path_objects.contains(self.text(object))
+        {
+            return Some(format!("{}->{}", self.text(object), self.text(name)));
+        }
+        None
+    }
+    fn path_effects(&self, node: Ast<'_>, scope: &mut Scope) {
+        if !scope.activation_eligible || !scope.path_clean {
+            scope.paths.clear();
+            scope.path_objects.clear();
+            return;
+        }
+        // Definitions are dormant. All other unmodelled statements may mutate
+        // globals, aliases or references, including calls and every include.
+        if matches!(
+            node.kind(),
+            "php_tag" | "comment" | "namespace_use_declaration" | "function_definition"
+        ) {
+            return;
+        }
+        let assignment = (node.kind() == "expression_statement")
+            .then(|| node.named_child(0))
+            .flatten()
+            .filter(|expr| expr.kind() == "assignment_expression");
+        if let Some(expr) = assignment
+            && let (Some(left), Some(right)) = (
+                expr.child_by_field_name("left"),
+                expr.child_by_field_name("right"),
+            )
+        {
+            // Alias/reference assignments cannot retain the original object's proof.
+            if let Some(key) = self.path_key(left, scope)
+                && !scope.path_inputs.contains(&key)
+                && let Some(value) = self.include_value(right, scope, 0)
+            {
+                if left.kind() == "variable_name" && scope.path_objects.contains(&key) {
+                    scope.paths.clear();
+                    scope.path_objects.clear();
+                }
+                if scope.paths.len() >= 256 {
+                    scope.paths.clear();
+                    scope.path_objects.clear();
+                }
+                scope.paths.insert(key, value);
+                return;
+            }
+            if left.kind() == "variable_name"
+                && right.kind() == "object_creation_expression"
+                && !scope.path_inputs.contains(self.text(left))
+                && self.constructor_class(right, scope).as_deref() == Some("stdclass")
+                && children(right)
+                    .iter()
+                    .all(|child| child.kind() != "arguments" || child.named_child_count() == 0)
+                && children(right).iter().any(|child| {
+                    named(*child) && self.text(*child).eq_ignore_ascii_case("\\stdClass")
+                })
+            {
+                // Replacing an object may leave aliases; forget all old facts first.
+                scope.paths.clear();
+                scope.path_objects.clear();
+                scope.path_objects.insert(self.text(left).to_owned());
+                return;
+            }
+        }
+        scope.paths.clear();
+        scope.path_objects.clear();
+        scope.path_clean = false;
+    }
+    fn include_value(&self, node: Ast<'_>, scope: &Scope, depth: usize) -> Option<(String, bool)> {
         if depth > 32 {
             return None;
         }
@@ -582,13 +745,54 @@ impl Extractor<'_> {
             "name" if self.text(node).eq_ignore_ascii_case("__FILE__") => {
                 Some((self.file.into(), true))
             }
-            "parenthesized_expression" => self.include_value(node.named_child(0)?, depth + 1),
+            "variable_name" | "member_access_expression"
+                if scope.activation_eligible && scope.path_clean =>
+            {
+                scope.paths.get(&self.path_key(node, scope)?).cloned()
+            }
+            "parenthesized_expression" => {
+                self.include_value(node.named_child(0)?, scope, depth + 1)
+            }
             "binary_expression" if self.text(node.child_by_field_name("operator")?) == "." => {
                 let (left, anchored) =
-                    self.include_value(node.child_by_field_name("left")?, depth + 1)?;
+                    self.include_value(node.child_by_field_name("left")?, scope, depth + 1)?;
                 let (right, _) =
-                    self.include_value(node.child_by_field_name("right")?, depth + 1)?;
-                Some((left + &right, anchored))
+                    self.include_value(node.child_by_field_name("right")?, scope, depth + 1)?;
+                (left.len().checked_add(right.len())? <= MAX_PATH_BYTES)
+                    .then(|| (left + &right, anchored))
+            }
+            "function_call_expression" => {
+                let callee = node.child_by_field_name("function")?;
+                let raw = self.text(callee);
+                // A namespace or use-function alias may replace unqualified dirname.
+                if !(raw.eq_ignore_ascii_case("\\dirname")
+                    || raw.eq_ignore_ascii_case("dirname")
+                        && scope.namespace.is_empty()
+                        && !scope.functions.contains_key("dirname"))
+                {
+                    return None;
+                }
+                let args = node.child_by_field_name("arguments")?;
+                if args.named_child_count() != 1 {
+                    return None;
+                }
+                let argument = args.named_child(0)?.named_child(0)?;
+                if argument.kind() != "name" || !self.text(argument).eq_ignore_ascii_case("__DIR__")
+                {
+                    return None;
+                }
+                let (directory, anchored) = self.include_value(argument, scope, depth + 1)?;
+                if directory.is_empty() {
+                    return None;
+                }
+                Some((
+                    directory
+                        .rsplit_once('/')
+                        .map(|(parent, _)| parent)
+                        .unwrap_or("")
+                        .to_owned(),
+                    anchored,
+                ))
             }
             "string" | "encapsed_string" => {
                 let raw = self.text(node);
@@ -598,7 +802,10 @@ impl Extractor<'_> {
                 }
                 let inner = &raw[1..raw.len() - 1];
                 // Conservative constant evaluation: interpolated/escaped paths stay unresolved.
-                if inner.contains('\\') || quote == '"' && inner.contains('$') {
+                if inner.len() > MAX_PATH_BYTES
+                    || inner.contains('\\')
+                    || quote == '"' && inner.contains('$')
+                {
                     return None;
                 }
                 Some((String::from_utf8(decode_source(inner)).ok()?, false))
@@ -606,66 +813,48 @@ impl Extractor<'_> {
             _ => None,
         }
     }
-    fn include_target(&self, node: Ast<'_>) -> Option<String> {
-        let (value, anchored) = self.include_value(node, 0)?;
+    fn include_target(&self, node: Ast<'_>, scope: &Scope) -> Option<String> {
+        let (value, anchored) = self.include_value(node, scope, 0)?;
         if !anchored || value.contains(['\0', '\\']) {
             return None;
         }
-        let mut parts = Vec::new();
-        for part in value.split('/') {
+        let ancestors: Vec<_> = self
+            .file
+            .rsplit_once('/')
+            .map(|(dir, _)| dir.split('/').collect())
+            .unwrap_or_default();
+        let raw_parts: Vec<_> = value
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .collect();
+        let trusted = raw_parts
+            .iter()
+            .zip(&ancestors)
+            .take_while(|(part, ancestor)| part == ancestor)
+            .count();
+        let mut parts: Vec<(&str, bool)> = Vec::new();
+        for (index, part) in raw_parts.into_iter().enumerate() {
             match part {
                 "" | "." => {}
                 ".." => {
-                    parts.pop()?;
-                }
-                part => parts.push(part),
-            }
-        }
-        Some(parts.join("/"))
-    }
-    fn definite_requires(&self, root: Ast<'_>) -> HashSet<usize> {
-        let mut result = HashSet::new();
-        let mut prefix = true;
-        let mut pending = children(root);
-        pending.reverse();
-        while let Some(node) = pending.pop() {
-            match node.kind() {
-                "namespace_definition" => {
-                    if let Some(body) = node.child_by_field_name("body") {
-                        pending.extend(children(body).into_iter().rev());
+                    // `link/..` follows the symlink before walking to its parent.
+                    // Only source ancestry (the walker never follows symlinks)
+                    // can safely be cancelled without filesystem evaluation.
+                    let (_, safe) = parts.pop()?;
+                    if !safe {
+                        return None;
                     }
                 }
-                "php_tag"
-                | "comment"
-                | "namespace_use_declaration"
-                | "function_definition"
-                | "class_declaration"
-                | "interface_declaration"
-                | "trait_declaration"
-                | "enum_declaration" => {}
-                "text" if self.text(node).trim().is_empty() => {}
-                "expression_statement" if prefix => {
-                    let requirement = node.named_child(0).filter(|expression| {
-                        matches!(
-                            expression.kind(),
-                            "require_expression" | "require_once_expression"
-                        ) && expression
-                            .named_child(0)
-                            .and_then(|value| self.include_target(value))
-                            .is_some()
-                    });
-                    if let Some(requirement) = requirement {
-                        result.insert(requirement.start_byte());
-                    } else {
-                        prefix = false;
-                    }
-                }
-                // A return, branch, loop, or opaque executable statement may
-                // bypass a later require. Such includes remain ordinary facts.
-                _ => prefix = false,
+                part => parts.push((part, index < trusted)),
             }
         }
-        result
+        Some(
+            parts
+                .into_iter()
+                .map(|(part, _)| part)
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
     }
     fn imports(&self, node: Ast<'_>, scope: &mut Scope) -> Result<()> {
         let declaration_type = node
@@ -766,8 +955,13 @@ impl Extractor<'_> {
                 return Ok(false);
             }
             "if_statement" | "while_statement" | "do_statement" | "for_statement"
-            | "foreach_statement" | "switch_statement" | "try_statement" | "catch_clause" => {
+            | "foreach_statement" | "switch_statement" | "try_statement" | "catch_clause"
+            | "declare_statement" => {
                 let mut next = scope.clone();
+                next.activation_eligible = false;
+                next.paths.clear();
+                next.path_objects.clear();
+                next.path_clean = false;
                 let (invalid, clear) = self.effects(node, scope);
                 if clear {
                     next.receivers.clear();
@@ -856,6 +1050,44 @@ impl Extractor<'_> {
                 }
                 let mut next = scope.clone();
                 next.owner = entity.id.clone();
+                next.paths.clear();
+                next.path_objects.clear();
+                next.activation_eligible = !is_class
+                    && !node
+                        .child_by_field_name("body")
+                        .is_some_and(|body| has_jump(&children(body)));
+                next.activation_reachable = true;
+                next.deferred |= !is_class;
+                // File variables and closure captures may already hold objects
+                // whose destructors run on assignment. Fresh named callable
+                // locals have a bounded clean symbol table until an opaque
+                // statement; parameters always remain unknown inputs.
+                next.path_clean = self.computed_paths_allowed
+                    && matches!(node.kind(), "function_definition" | "method_declaration");
+                next.path_inputs = node
+                    .child_by_field_name("parameters")
+                    .map(children)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|parameter| parameter.child_by_field_name("name"))
+                    .map(|name| self.text(name).to_owned())
+                    .collect();
+                next.path_inputs.extend(
+                    [
+                        "$GLOBALS",
+                        "$_SESSION",
+                        "$_GET",
+                        "$_POST",
+                        "$_SERVER",
+                        "$_ENV",
+                        "$_FILES",
+                        "$_COOKIE",
+                        "$_REQUEST",
+                        "$this",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned),
+                );
                 if is_class {
                     next.class_id = Some(entity.id);
                     next.class = Some(fq);
@@ -961,8 +1193,7 @@ impl Extractor<'_> {
                     // This grammar represents PHP's eval construct as a named
                     // call. Its evaluated declarations are not ordinary symbols.
                     if raw.eq_ignore_ascii_case("eval") {
-                        self.store
-                            .symbol("php-loader-unknown", self.file, &scope.owner)?;
+                        self.loader_unknown(scope)?;
                         return Ok(true);
                     }
                     let target = self.resolve_name(raw, scope, true);
@@ -970,14 +1201,13 @@ impl Extractor<'_> {
                         && !scope.functions.contains_key(&raw.to_ascii_lowercase())
                         && !scope.namespace.is_empty())
                     .then(|| raw.to_ascii_lowercase());
-                    self.store.reference(
+                    self.store.php_function_reference(
                         &scope.owner,
-                        "php-function",
                         &target,
                         fallback.as_deref(),
-                        "calls",
                         self.file,
                         line,
+                        self.direct_event(node, scope),
                     )?;
                 } else {
                     self.stats.dynamic_php_references += 1;
@@ -1095,14 +1325,29 @@ impl Extractor<'_> {
             | "require_once_expression" => {
                 let target = node
                     .named_child(0)
-                    .and_then(|expression| self.include_target(expression));
+                    .and_then(|expression| self.include_target(expression, scope));
+                let event = self.direct_event(node, scope);
+                let definite = event > 0
+                    && matches!(
+                        node.kind(),
+                        "require_expression" | "require_once_expression"
+                    );
+                if definite {
+                    self.store.php_require(
+                        &scope.owner,
+                        self.file,
+                        event,
+                        target.as_deref().unwrap_or(""),
+                        line,
+                    )?;
+                }
                 if let Some(target) = target {
                     self.store.reference(
                         &scope.owner,
                         "file",
                         &target,
                         None,
-                        if self.definite_requires.contains(&node.start_byte()) {
+                        if definite {
                             "includes:definite"
                         } else {
                             "includes"
@@ -1114,14 +1359,12 @@ impl Extractor<'_> {
                     // A bare relative include depends on runtime cwd/include_path.
                     // Preserve uncertainty for an active autoload file's
                     // transitive include chain without publishing a fake edge.
-                    self.store
-                        .symbol("php-loader-unknown", self.file, &scope.owner)?;
+                    self.loader_unknown(scope)?;
                     self.stats.dynamic_php_references += 1;
                 }
             }
             "eval_intrinsic" => {
-                self.store
-                    .symbol("php-loader-unknown", self.file, &scope.owner)?;
+                self.loader_unknown(scope)?;
             }
             _ => {}
         }
@@ -1149,12 +1392,13 @@ pub fn extract(
         file,
         store,
         stats,
-        definite_requires: HashSet::new(),
+        computed_paths_allowed: !has_ticks(tree.root_node(), source),
     };
-    ex.definite_requires = ex.definite_requires(tree.root_node());
     let mut section = Vec::new();
     let base = Scope {
         owner: file_id.into(),
+        activation_eligible: !has_jump(&children(tree.root_node())),
+        activation_reachable: true,
         ..Default::default()
     };
     let mut scope = base.clone();
